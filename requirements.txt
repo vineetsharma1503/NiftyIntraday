@@ -1,0 +1,7 @@
+pandas
+numpy
+pytz
+upstox-python-sdk
+playwright
+pyotp
+requests

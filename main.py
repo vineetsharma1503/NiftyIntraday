@@ -1,0 +1,472 @@
+# ============================================================================
+# STRATEGY2 - NIFTY CANDLE BREAKOUT OPTIONS TRADING
+# ============================================================================
+
+from datetime import datetime, time, timedelta
+from time import sleep 
+import warnings
+warnings.filterwarnings('ignore')
+import pandas as pd
+import numpy as np
+from upstoxapi import UpstoxApi
+import Config
+from logger import logger
+import Utility
+from pivot_points import calculate_daily_pivot_levels_from_candles
+from strategy_logic import evaluate_strategy_signal
+
+
+class MockUplink:
+    """Lightweight fallback used when running locally in test mode."""
+
+    def __init__(self):
+        self._candle_data = pd.DataFrame([
+            {'date': pd.Timestamp('2026-07-06 09:15:00', tz='Asia/Kolkata'), 'open': 22300.0, 'high': 22320.0, 'low': 22280.0, 'close': 22310.0, 'volume': 1000, 'oi': 0},
+            {'date': pd.Timestamp('2026-07-06 09:16:00', tz='Asia/Kolkata'), 'open': 22310.0, 'high': 22340.0, 'low': 22300.0, 'close': 22335.0, 'volume': 1000, 'oi': 0},
+            {'date': pd.Timestamp('2026-07-06 09:17:00', tz='Asia/Kolkata'), 'open': 22335.0, 'high': 22360.0, 'low': 22320.0, 'close': 22350.0, 'volume': 1000, 'oi': 0},
+        ])
+
+    def customCandleData(self, instrument_key, timeframe):
+        return self._candle_data.copy()
+
+    def getLTP(self, instrument_key):
+        return 22350.0
+
+    def placeMultipleOrder(self, instrument_key, qty, trans_type, order_type):
+        logger.info('Mock order placed')
+        return 'mock-order-id'
+
+    def isAllOrderTraded(self, order_list):
+        return True, pd.DataFrame([{'average_price': 22350.0}])
+
+    def closePosition(self, instrument_key, qty, trans_type=None):
+        logger.info('Mock position close')
+        return 'mock-close-id'
+
+    def exit_all(self):
+        logger.info('Mock exit_all called')
+
+
+def check_candle_breakout(candle_data, candle_count=2, direction='LONG'):
+    """
+    Check for candle breakout pattern
+    
+    Args:
+        candle_data: DataFrame with OHLC data
+        candle_count: Number of candles to check for breakout
+        direction: 'LONG' for breakout of highs, 'SHORT' for breakdown of lows
+    
+    Returns:
+        bool: True if breakout detected, False otherwise
+    """
+    try:
+        if len(candle_data) < candle_count + 1:
+            return False
+        
+        # Get the last few candles
+        recent_candles = candle_data.tail(candle_count + 1)
+        
+        if direction == 'LONG':
+            # Check if the latest candle breaks above the high of previous candles
+            previous_candles = recent_candles.iloc[:-1]  # All except the last candle
+            current_candle = recent_candles.iloc[-1]     # Last candle
+            
+            # Find the highest high of previous candles
+            previous_high = previous_candles['high'].max()
+            
+            # Check if current candle closes above the previous high
+            breakout = current_candle['close'] > previous_high
+            
+            logger.info(f"LONG Breakout Check - Previous High: {previous_high}, "
+                       f"Current Close: {current_candle['close']}, Breakout: {breakout}")
+            
+            return breakout
+            
+        elif direction == 'SHORT':
+            # Check if the latest candle breaks below the low of previous candles
+            previous_candles = recent_candles.iloc[:-1]  # All except the last candle
+            current_candle = recent_candles.iloc[-1]     # Last candle
+            
+            # Find the lowest low of previous candles
+            previous_low = previous_candles['low'].min()
+            
+            # Check if current candle closes below the previous low
+            breakdown = current_candle['close'] < previous_low
+            
+            logger.info(f"SHORT Breakdown Check - Previous Low: {previous_low}, "
+                       f"Current Close: {current_candle['close']}, Breakdown: {breakdown}")
+            
+            return breakdown
+            
+        return False
+        
+    except Exception as e:
+        logger.error(f"Error in breakout check: {e}")
+        return False
+
+
+def is_test_mode_enabled():
+    """Return normalized TEST_MODE flag from strategy config."""
+    value = Config.STRATEGY_CONFIG.get('TEST_MODE', False)
+    if isinstance(value, str):
+        return value.strip().lower() in {'1', 'true', 'yes', 'on'}
+    return bool(value)
+
+
+def is_trading_time():
+    """Check if current time is within trading hours"""
+    if is_test_mode_enabled():
+        return True  # Always return True in test mode
+        
+    current_time = datetime.now(Config.TIME_ZONE)
+    start_time = current_time.replace(hour=Config.TRADING_HOURS['START'][0], minute=Config.TRADING_HOURS['START'][1], second=0)
+    exit_time = current_time.replace(hour=Config.TRADING_HOURS['END'][0], minute=Config.TRADING_HOURS['END'][1], second=0)
+    return start_time <= current_time < exit_time
+
+
+def check_stop_loss_target(uplink_obj, symbol, position_config):
+    """Check if stop loss or target is hit"""
+    try:
+        current_ltp = uplink_obj.getLTP(position_config['option_instrument'])
+        if current_ltp is None:
+            return False
+            
+        entry_price = position_config['entry_price']
+        pnl_percent = ((current_ltp - entry_price) / entry_price) * 100
+        
+        logger.info(f'{symbol} LTP: {current_ltp}, Entry: {entry_price}, PnL: {pnl_percent:.2f}%')
+        
+        # Check exit conditions
+        stop_loss = Config.STRATEGY_CONFIG['STOP_LOSS_PERCENT']
+        target = Config.STRATEGY_CONFIG['TARGET_PERCENT']
+        
+        if pnl_percent <= -stop_loss:
+            logger.info(f'{symbol} Stop loss hit! PnL: {pnl_percent:.2f}%')
+            return True
+        elif pnl_percent >= target:
+            logger.info(f'{symbol} Target hit! PnL: {pnl_percent:.2f}%')
+            return True
+            
+        return False
+        
+    except Exception as e:
+        logger.exception(f'Error in stop loss/target check: {e}')
+        return False
+
+
+def _get_daily_entry_count(symbol):
+    """Return the number of entries already taken for the current day."""
+    today = datetime.now(Config.TIME_ZONE).strftime('%Y-%m-%d')
+    entry_counts = getattr(Config, 'DAILY_ENTRY_COUNTS', {})
+    if today not in entry_counts:
+        entry_counts[today] = {}
+        setattr(Config, 'DAILY_ENTRY_COUNTS', entry_counts)
+    return int(entry_counts[today].get(symbol, 0))
+
+
+def _increment_daily_entry_count(symbol):
+    """Increment the daily entry count for a symbol."""
+    today = datetime.now(Config.TIME_ZONE).strftime('%Y-%m-%d')
+    entry_counts = getattr(Config, 'DAILY_ENTRY_COUNTS', {})
+    if today not in entry_counts:
+        entry_counts[today] = {}
+    entry_counts[today][symbol] = _get_daily_entry_count(symbol) + 1
+    setattr(Config, 'DAILY_ENTRY_COUNTS', entry_counts)
+
+
+def _get_fixed_daily_pivot_levels(uplink_obj, symbol, instrument_key):
+    """Fetch previous-session daily pivot once per day and keep it constant intraday."""
+    today = datetime.now(Config.TIME_ZONE).strftime('%Y-%m-%d')
+    pivot_cache = getattr(Config, 'DAILY_PIVOT_LEVELS', {})
+    if today in pivot_cache and symbol in pivot_cache[today]:
+        return pivot_cache[today][symbol]
+
+    if not hasattr(uplink_obj, 'getHistoricalData'):
+        logger.warning('%s daily pivot unavailable: uplink has no getHistoricalData; using fallback pivot logic', symbol)
+        return None
+
+    to_date = (datetime.now(Config.TIME_ZONE).date() - timedelta(days=1)).strftime('%Y-%m-%d')
+    from_date = (datetime.now(Config.TIME_ZONE).date() - timedelta(days=14)).strftime('%Y-%m-%d')
+    daily_data = uplink_obj.getHistoricalData(instrument_key, to_date, from_date, interval='day')
+    if daily_data is None or len(daily_data) == 0:
+        logger.warning('%s daily pivot unavailable: no daily candles from Upstox; using fallback pivot logic', symbol)
+        return None
+
+    daily_frame = daily_data.copy()
+    if 'date' in daily_frame.columns:
+        daily_frame['date'] = pd.to_datetime(daily_frame['date'], errors='coerce', utc=True).dt.tz_convert(Config.TIME_ZONE)
+        daily_frame = daily_frame.dropna(subset=['date'])
+        today_date = datetime.now(Config.TIME_ZONE).date()
+        previous_sessions = daily_frame[daily_frame['date'].dt.date < today_date]
+        source_frame = previous_sessions if not previous_sessions.empty else daily_frame
+    else:
+        source_frame = daily_frame
+
+    if source_frame.empty:
+        logger.warning('%s daily pivot unavailable: usable daily candles are empty; using fallback pivot logic', symbol)
+        return None
+
+    pivot_row = source_frame.iloc[-1]
+    levels = calculate_daily_pivot_levels_from_candles(pivot_row)
+    levels = {
+        'pivot': float(levels['pivot']),
+        'r1': float(levels['r1']),
+        's1': float(levels['s1']),
+        'source_date': str(pivot_row.get('date')),
+    }
+
+    if today not in pivot_cache:
+        pivot_cache[today] = {}
+    pivot_cache[today][symbol] = levels
+    setattr(Config, 'DAILY_PIVOT_LEVELS', pivot_cache)
+
+    logger.info('%s fixed daily pivot set for %s: %s', symbol, today, levels)
+    return levels
+
+
+def check_entry_signals(uplink_obj):
+    """Main signal checking logic based on pivot and Supertrend rules."""
+    logger.info(f'Position Config: {Config.POSITION_CONFIG}')
+
+    symbol = 'NIFTY'
+    symbol_config = Config.NIFTY_CONFIG
+    if not symbol_config['enable']:
+        return
+
+    lots = int(Config.STRATEGY_CONFIG.get('LOTS', 1))
+    max_entries = int(Config.STRATEGY_CONFIG.get('MAX_ENTRIES', 3))
+    timeframe = int(Config.STRATEGY_CONFIG.get('TIMEFRAME', 5))
+    is_position_open = symbol in Config.POSITION_CONFIG
+    daily_pivot_levels = _get_fixed_daily_pivot_levels(uplink_obj, symbol, symbol_config['index_instrument'])
+
+    candle_data = uplink_obj.customCandleData(symbol_config['index_instrument'], timeframe)
+    if candle_data is None or len(candle_data) == 0:
+        logger.warning('%s candle data unavailable or empty; skipping signal check', symbol)
+        return
+    logger.info(f'{symbol} candle data:\n{candle_data.tail(3)}')
+
+    if is_position_open:
+        position_config = Config.POSITION_CONFIG[symbol]
+        signal = evaluate_strategy_signal(
+            candle_data,
+            position_open=True,
+            position_option_type=position_config.get('option_type'),
+            pivot_levels=daily_pivot_levels,
+            entry_count=_get_daily_entry_count(symbol),
+            lots=lots,
+            max_entries=max_entries,
+        )
+        if signal.get('action') == 'exit':
+            exit_position(uplink_obj, symbol, int(position_config.get('qty', 0)))
+            return
+        return
+
+    signal = evaluate_strategy_signal(
+        candle_data,
+        position_open=False,
+        pivot_levels=daily_pivot_levels,
+        entry_count=_get_daily_entry_count(symbol),
+        lots=lots,
+        max_entries=max_entries,
+    )
+    if signal.get('action') == 'enter':
+        option_type = signal.get('option_type')
+        if option_type:
+            if execute_entry(uplink_obj, symbol, symbol_config, candle_data.iloc[-1]['close'], option_type, symbol_config['lot_size'], lots=lots):
+                _increment_daily_entry_count(symbol)
+
+
+def check_new_entry(uplink_obj, symbol, symbol_config, candle_data, qty):
+    """Check for new entry opportunities"""
+    try:
+        # Check for breakout based on strategy direction
+        strategy_direction = Config.STRATEGY_CONFIG['DIRECTION']
+        candle_count = Config.STRATEGY_CONFIG['CANDLE_COUNT']
+        
+        entry_signal = False
+        option_type = None
+        
+        if strategy_direction == 'LONG':
+            if check_candle_breakout(candle_data, candle_count, 'LONG'):
+                entry_signal = True
+                option_type = 'CE'
+                logger.info(f'{symbol} LONG entry: Candle breakout detected')
+                
+        elif strategy_direction == 'SHORT':
+            if check_candle_breakout(candle_data, candle_count, 'SHORT'):
+                entry_signal = True
+                option_type = 'PE'
+                logger.info(f'{symbol} SHORT entry: Candle breakdown detected')
+        
+        if entry_signal and option_type:
+            # Get current NIFTY price
+            current_price = candle_data.iloc[-1]['close']
+            execute_entry(uplink_obj, symbol, symbol_config, current_price, option_type, qty)
+            
+    except Exception as e:
+        logger.exception(f'Error in new entry check: {e}')
+
+
+def execute_entry(uplink_obj, symbol, symbol_config, spot_price, option_type, qty, lots=1):
+    """Execute entry order for selling an ATM option."""
+    try:
+        option_instrument = Utility.get_option_instrument(
+            spot_price,
+            option_type,
+            moneyness='ATM',
+            expiry_preference=Config.STRATEGY_CONFIG['EXPIRY_PREFERENCE']
+        )
+
+        if not option_instrument:
+            logger.error(f'Could not find {option_type} option for {symbol}')
+            return False
+
+        base_lot_size = Utility.get_instrument_lot_size(option_instrument, default_lot_size=qty)
+        order_qty = int(base_lot_size * lots)
+        logger.info(f'{symbol} placing {option_type} sell order for qty: {order_qty}')
+        entry_order_id = uplink_obj.placeMultipleOrder(option_instrument, order_qty, 'SELL', 'MARKET')
+
+        if not entry_order_id:
+            logger.error('Entry order placement failed for %s', symbol)
+            return False
+
+        use_v3_order_flow = hasattr(uplink_obj, '_use_v3_order_api') and uplink_obj._use_v3_order_api()
+        if use_v3_order_flow:
+            # V3 place-order returns acknowledgment; keep fill tracking separate from entry signal path.
+            entry_price = float(spot_price)
+            Config.POSITION_CONFIG[symbol] = {
+                'option_instrument': option_instrument,
+                'index_instrument': symbol_config['index_instrument'],
+                'qty': order_qty,
+                'entry_price': entry_price,
+                'option_type': option_type,
+                'lots': lots,
+                'entry_order_id': entry_order_id,
+                'order_status': 'submitted',
+            }
+            logger.info('%s entry submitted via V3 order API | order_id=%s | assumed_entry_price=%s', symbol, entry_order_id, entry_price)
+            return True
+
+        for i in range(10):
+            all_traded, order_df = uplink_obj.isAllOrderTraded([entry_order_id])
+            if all_traded:
+                break
+            sleep(i)
+
+        if all_traded:
+            entry_price = float(order_df.iloc[0]['average_price'])
+            Config.POSITION_CONFIG[symbol] = {
+                'option_instrument': option_instrument,
+                'index_instrument': symbol_config['index_instrument'],
+                'qty': order_qty,
+                'entry_price': entry_price,
+                'option_type': option_type,
+                'lots': lots,
+            }
+            logger.info(f'{symbol} entry successful at price: {entry_price}')
+            return True
+        else:
+            logger.warning(f'Entry order {entry_order_id} not completed')
+            return False
+
+    except Exception as e:
+        logger.exception(f'Error in entry execution: {e}')
+        return False
+
+
+def exit_position(uplink_obj, symbol, qty):
+    """Exit existing position"""
+    try:
+        logger.info(f'{symbol} exiting position')
+        uplink_obj.closePosition(Config.POSITION_CONFIG[symbol]['option_instrument'], qty, 'BUY')
+        Config.POSITION_CONFIG.pop(symbol)
+        logger.info(f'{symbol} position closed')
+    except Exception as e:
+        logger.exception(f'Error in position exit: {e}')
+
+
+def get_sync_time():
+    """Return the sleep time between strategy evaluations."""
+    tf = int(Config.STRATEGY_CONFIG.get('TIMEFRAME', 5))
+    return max(60, tf * 60)
+
+
+def get_candle_close_buffer_seconds():
+    """Return execution buffer in seconds after each timeframe boundary."""
+    return max(0.0, float(Config.STRATEGY_CONFIG.get('CANDLE_CLOSE_BUFFER_SECONDS', 1)))
+
+
+def get_next_check_time(current_time=None):
+    """Return the next timeframe-aligned check time with close-buffer applied."""
+    now = current_time or datetime.now(Config.TIME_ZONE)
+    timeframe = max(1, int(Config.STRATEGY_CONFIG.get('TIMEFRAME', 5)))
+    buffer_seconds = get_candle_close_buffer_seconds()
+
+    rounded = now.replace(second=0, microsecond=0)
+    minute_mod = rounded.minute % timeframe
+    if minute_mod != 0:
+        rounded = rounded + timedelta(minutes=(timeframe - minute_mod))
+
+    scheduled = rounded + timedelta(seconds=buffer_seconds)
+    if now >= scheduled:
+        scheduled = scheduled + timedelta(minutes=timeframe)
+    return scheduled
+
+
+def main_trading_loop(uplink_obj):
+    """Main trading loop."""
+    logger.info('Main trading loop started | test_mode=%s', is_test_mode_enabled())
+
+    while True:
+        test_mode = is_test_mode_enabled()
+        current_time = datetime.now(Config.TIME_ZONE)
+        if not test_mode and not is_trading_time():
+            logger.info('Outside trading hours at %s; waiting for next cycle', current_time)
+            sleep(get_sync_time())
+            continue
+
+        next_check_time = get_next_check_time(current_time)
+        wait_seconds = max(0.0, (next_check_time - current_time).total_seconds())
+        logger.info('Waiting for next aligned check at %s (sleep %.2fs)', next_check_time, wait_seconds)
+        sleep(wait_seconds)
+
+        trigger_time = datetime.now(Config.TIME_ZONE)
+        if not test_mode and not is_trading_time():
+            logger.info('Skipped signal check at %s due to trading window', trigger_time)
+            continue
+
+        logger.info('Starting signal check at %s (scheduled %s)', trigger_time, next_check_time)
+        check_entry_signals(uplink_obj)
+
+
+if __name__ == '__main__':
+    # Check if in test mode
+    if is_test_mode_enabled():
+        logger.info('Running in TEST MODE - skipping market timing checks only; API calls remain live/sandbox based on config')
+    else:
+        # Wait for market start
+        start_time = datetime.now(Config.TIME_ZONE)
+        market_start = start_time.replace(hour=Config.TRADING_HOURS['START'][0], minute=Config.TRADING_HOURS['START'][1], second=0)
+        wait_time = max(0, (market_start - start_time).total_seconds())
+        
+        if wait_time > 0:
+            logger.info(f'Waiting for market start: {wait_time} seconds')
+            sleep(wait_time)
+    
+    logger.info('Starting strategy entrypoint | current_time=%s | test_mode=%s', datetime.now(Config.TIME_ZONE), is_test_mode_enabled())
+
+    try:
+        Utility.initialize_system()
+    except Exception as exc:
+        logger.exception('Initialization failed: %s', exc)
+        raise
+
+    # Runtime always uses Upstox API; MockUplink is intended for unit tests only.
+    Config.UPLINK_OBJ = UpstoxApi(accessToken=Config.ACCESS_TOKEN)
+    uplink_obj = Config.UPLINK_OBJ
+    
+    logger.info('Starting NIFTY Option Selling Intraday Strategy')
+    main_trading_loop(uplink_obj)
+    
+    logger.info('Market closed - Squaring off all positions')
+    uplink_obj.exit_all()
