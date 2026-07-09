@@ -1,23 +1,23 @@
-# Strategy2 - NIFTY Candle Breakout Options Trading
+# Strategy - NIFTY Intraday Directional Options Trading
 
 ## Overview
-A clean and robust candle breakout strategy for trading NIFTY options. This strategy monitors NIFTY 50 index price movements and executes option trades based on candle breakout patterns with comprehensive risk management.
+A clean and robust strategy for trading NIFTY options. This strategy uses Pivot Points standard and Supertrend to generate entry and exit signals.
 
 ## Strategy Logic
 
 ### Entry Conditions
 1. **LONG Direction**: 
-   - Current candle closes above the highest high of previous N candles
-   - → Buy Call Option (CE)
+   - Current candle on 5 mins time frame closes above the R1 AND Supertrend(7,3).
+   - → Sell ATM Put Option (PE) of nearest expiry (including expiry day)
 
 2. **SHORT Direction**: 
-   - Current candle closes below the lowest low of previous N candles  
-   - → Buy Put Option (PE)
+   - Current candle closes below the S1 AND Supertrend (7,3).
+   - → Sell ATM Call Option (CE) of nearest expiry (including expiry day)
 
 ### Exit Conditions
-- **Stop Loss**: Configurable percentage loss (default: 2%)
-- **Target**: Configurable percentage profit (default: 4%)
-- **Auto Exit**: 5 minutes before market close (3:25 PM)
+- **LONG Direction**: If 5 minute candle closes below R1 OR Supertrend (7,3)
+- **SHORT Direction**: If 5 minute candle closes above S1 OR Supertrend (7,3)
+- **Target**: Exit at 3:15 PM to extract maximum theta.
 
 ## Configuration
 
@@ -25,21 +25,18 @@ Edit `Config.py` to customize the strategy:
 
 ```python
 STRATEGY_CONFIG = {
-    'TIMEFRAME': 1,              # Candle timeframe in minutes 
-    'CANDLE_COUNT': 2,           # Number of candles to check for breakout
-    'DIRECTION': 'LONG',         # 'LONG' or 'SHORT'
-    'STOP_LOSS_PERCENT': 2.0,    # Stop loss percentage
-    'TARGET_PERCENT': 4.0,       # Target percentage
+    'TIMEFRAME': 5,              # Candle timeframe in minutes 
     'OPTION_MONEYNESS': 'ATM',   # ATM, ITM1, ITM2, OTM1, OTM2
     'EXPIRY_PREFERENCE': 'weekly', # weekly or monthly
     'TEST_MODE': False           # Skip market timing for testing
+    'CANDLE_CLOSE_BUFFER_SECONDS': 1,  # Delay after candle boundary before evaluating signals
+    'LOTS': 1,                   # Default number of option lots per entry
+    'MAX_ENTRIES': 3,            # Maximum number of entries per day
+    'SUPERTREND_LENGTH': 7,     # Supertrend ATR period (TradingView default)
+    'SUPERTREND_MULTIPLIER': 3.0,  # Supertrend ATR multiplier
 }
 ```
 
-### Option Selection
-- **ATM**: At The Money (closest to spot price)
-- **ITM1/ITM2**: In The Money (1-2 strikes inside)
-- **OTM1/OTM2**: Out of The Money (1-2 strikes outside)
 
 ### Strike Logic
 - NIFTY strikes are in 50-point intervals
@@ -77,7 +74,7 @@ The system now **validates tokens with real API calls**:
 ## Files Structure (Clean & Organized)
 
 ```
-strategy2/
+niftyintradayoption/
 ├── Config.py              # Strategy configuration (user settings)
 ├── main.py               # Main strategy logic & candle breakout signals  
 ├── upstoxapi.py          # Upstox API wrapper (simplified)
@@ -102,11 +99,15 @@ strategy2/
 3. **Configure Strategy**
    ```python
    # Edit STRATEGY_CONFIG in Config.py
-   'TIMEFRAME': 1,              # 1-minute candles
-   'CANDLE_COUNT': 2,           # Check last 2 candles
-   'DIRECTION': 'LONG',         # Trade direction
-   'STOP_LOSS_PERCENT': 2.0,    # 2% stop loss
-   'TARGET_PERCENT': 4.0,       # 4% target
+   'TIMEFRAME': 5,              # Candle timeframe in minutes 
+    'OPTION_MONEYNESS': 'ATM',   # ATM, ITM1, ITM2, OTM1, OTM2
+    'EXPIRY_PREFERENCE': 'weekly', # weekly or monthly
+    'TEST_MODE': False           # Skip market timing for testing
+    'CANDLE_CLOSE_BUFFER_SECONDS': 1,  # Delay after candle boundary before evaluating signals
+    'LOTS': 1,                   # Default number of option lots per entry
+    'MAX_ENTRIES': 3,            # Maximum number of entries per day
+    'SUPERTREND_LENGTH': 7,     # Supertrend ATR period (TradingView default)
+    'SUPERTREND_MULTIPLIER': 3.0,  # Supertrend ATR multiplier
    ```
 
 4. **Run Strategy**
@@ -136,19 +137,13 @@ strategy2/
 2. Set your Upstox API credentials
 3. Run: `python main.py`
 
-## Example Configuration
 
-For a 5-minute, 2-candle breakout strategy:
-- `TIMEFRAME`: 5 (minutes)
-- `CANDLE_COUNT`: 2 (check last 2 candles)
-- If LONG: Buy CE when price breaks above 2-candle high
-- If SHORT: Buy PE when price breaks below 2-candle low
 
 ## Risk Management
 
-- **Stop Loss**: Automatic exit when option price moves against position by configured percentage
-- **Target**: Automatic exit when option price reaches profit target
-- **Time-based Exit**: All positions squared off before market close (3:25 PM)
+- **Stop Loss**: Dynamic exit given by the Supertrend. Signal check happens every 5 minutes
+- **Target**: Unless exit signal is generated the position will run till EOD (3:15 PM) to capture maximum theta
+
 
 ## Requirements
 
