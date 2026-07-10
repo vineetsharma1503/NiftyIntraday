@@ -5,6 +5,10 @@
 from datetime import datetime, time, timedelta
 from time import sleep 
 import warnings
+import json
+import os
+import re
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 warnings.filterwarnings('ignore')
 import pandas as pd
 import numpy as np
@@ -172,6 +176,165 @@ def _increment_daily_entry_count(symbol):
         entry_counts[today] = {}
     entry_counts[today][symbol] = _get_daily_entry_count(symbol) + 1
     setattr(Config, 'DAILY_ENTRY_COUNTS', entry_counts)
+    setattr(Config, 'PERSISTED_DAILY_ENTRY_COUNTS', dict(entry_counts))
+    _persist_daily_entry_counts_to_config(entry_counts)
+
+
+def _persist_daily_entry_counts_to_config(entry_counts):
+    """Persist daily entry counters directly into Config.py."""
+    try:
+        config_path = getattr(Config, '__file__', None)
+        if not config_path:
+            logger.warning('Skipping entry-count persistence: Config.__file__ unavailable')
+            return
+
+        config_path = str(config_path)
+        if config_path.endswith('.pyc'):
+            config_path = config_path[:-1]
+        config_path = os.path.abspath(config_path)
+
+        with open(config_path, 'r', encoding='utf-8') as file_obj:
+            content = file_obj.read()
+
+        serialized_counts = json.dumps(entry_counts, sort_keys=True)
+        replacement_line = f'PERSISTED_DAILY_ENTRY_COUNTS = {serialized_counts}'
+        assignment_pattern = r'(?m)^PERSISTED_DAILY_ENTRY_COUNTS\s*=\s*.*$'
+
+        if re.search(assignment_pattern, content):
+            updated_content = re.sub(assignment_pattern, replacement_line, content, count=1)
+        else:
+            anchor_pattern = r'(?m)^DAILY_ENTRY_COUNTS\s*=\s*.*$'
+            anchor_match = re.search(anchor_pattern, content)
+            if anchor_match:
+                insert_pos = anchor_match.start()
+                updated_content = content[:insert_pos] + replacement_line + '\n' + content[insert_pos:]
+            else:
+                updated_content = content.rstrip() + f'\n{replacement_line}\n'
+
+        if updated_content != content:
+            with open(config_path, 'w', encoding='utf-8') as file_obj:
+                file_obj.write(updated_content)
+            logger.info('Persisted daily entry counts to Config.py: %s', serialized_counts)
+    except Exception as exc:
+        logger.exception('Failed to persist daily entry counts into Config.py: %s', exc)
+
+
+def _load_daily_entry_counts_once():
+    """Initialize runtime daily entry counts from Config once per process start."""
+    if getattr(Config, '_DAILY_ENTRY_COUNTS_LOADED', False):
+        return
+
+    persisted = getattr(Config, 'PERSISTED_DAILY_ENTRY_COUNTS', {})
+    runtime_counts = getattr(Config, 'DAILY_ENTRY_COUNTS', {})
+    merged = dict(persisted) if isinstance(persisted, dict) else {}
+    if isinstance(runtime_counts, dict):
+        for date_key, symbol_counts in runtime_counts.items():
+            if date_key not in merged or not isinstance(merged.get(date_key), dict):
+                merged[date_key] = {}
+            if isinstance(symbol_counts, dict):
+                merged[date_key].update(symbol_counts)
+
+    setattr(Config, 'DAILY_ENTRY_COUNTS', merged)
+    setattr(Config, '_DAILY_ENTRY_COUNTS_LOADED', True)
+    logger.info('Daily entry counts initialized once at startup: %s', merged)
+
+
+def _infer_option_type(position_row):
+    """Infer CE/PE from broker position row fields."""
+    tokens = [
+        str(position_row.get('trading_symbol', '')).upper(),
+        str(position_row.get('tradingsymbol', '')).upper(),
+        str(position_row.get('instrument_token', '')).upper(),
+        str(position_row.get('instrument_key', '')).upper(),
+    ]
+    if any('PE' in token for token in tokens):
+        return 'PE'
+    if any('CE' in token for token in tokens):
+        return 'CE'
+    return None
+
+
+def _sync_position_config_from_broker(uplink_obj):
+    """Populate runtime POSITION_CONFIG from existing broker positions."""
+    symbol = 'NIFTY'
+    if not hasattr(uplink_obj, 'getPositionBook'):
+        logger.warning('Position sync skipped: uplink has no getPositionBook method')
+        return
+
+    try:
+        position_book = uplink_obj.getPositionBook()
+    except Exception as exc:
+        logger.exception('Position sync failed while fetching position book: %s', exc)
+        return
+
+    if not isinstance(position_book, dict):
+        logger.warning('Position sync skipped: unexpected position book payload type')
+        return
+
+    positions = position_book.get('data', [])
+    if not isinstance(positions, list):
+        logger.warning('Position sync skipped: unexpected data in position book payload')
+        return
+
+    candidates = []
+    for row in positions:
+        if not isinstance(row, dict):
+            continue
+
+        token = str(row.get('instrument_token', row.get('instrument_key', '')))
+        trading_symbol = str(row.get('trading_symbol', row.get('tradingsymbol', '')))
+        haystack = f'{token} {trading_symbol}'.upper()
+        if 'NIFTY' not in haystack:
+            continue
+
+        option_type = _infer_option_type(row)
+        if option_type not in {'CE', 'PE'}:
+            continue
+
+        try:
+            net_qty = int(float(row.get('quantity', 0)))
+        except Exception:
+            net_qty = 0
+        if net_qty >= 0:
+            # Strategy entries are short-option sells; only map short legs.
+            continue
+
+        candidates.append((row, option_type, abs(net_qty)))
+
+    if not candidates:
+        Config.POSITION_CONFIG.pop(symbol, None)
+        logger.info('No open short NIFTY option position found in broker book during startup sync')
+        return
+
+    selected_row, option_type, qty = max(candidates, key=lambda item: item[2])
+
+    entry_price = selected_row.get('average_price')
+    if entry_price is None:
+        entry_price = selected_row.get('sell_price', selected_row.get('buy_price', 0))
+    try:
+        entry_price = float(entry_price)
+    except Exception:
+        entry_price = 0.0
+
+    option_instrument = str(selected_row.get('instrument_token', selected_row.get('instrument_key', '')))
+    lots = max(1, int(round(qty / max(1, int(Config.NIFTY_CONFIG.get('lot_size', 1))))))
+
+    Config.POSITION_CONFIG[symbol] = {
+        'option_instrument': option_instrument,
+        'index_instrument': Config.NIFTY_CONFIG['index_instrument'],
+        'qty': int(qty),
+        'entry_price': entry_price,
+        'option_type': option_type,
+        'lots': lots,
+        'source': 'broker_sync',
+    }
+    logger.info('Startup position sync complete for %s: %s', symbol, Config.POSITION_CONFIG[symbol])
+
+
+def initialize_runtime_state(uplink_obj):
+    """Load persisted runtime counters and position state once at startup."""
+    _load_daily_entry_counts_once()
+    _sync_position_config_from_broker(uplink_obj)
 
 
 def _get_fixed_daily_pivot_levels(uplink_obj, symbol, instrument_key):
@@ -333,7 +496,14 @@ def execute_entry(uplink_obj, symbol, symbol_config, spot_price, option_type, qt
         use_v3_order_flow = hasattr(uplink_obj, '_use_v3_order_api') and uplink_obj._use_v3_order_api()
         if use_v3_order_flow:
             # V3 place-order returns acknowledgment; keep fill tracking separate from entry signal path.
-            entry_price = float(spot_price)
+            option_ltp = None
+            if hasattr(uplink_obj, 'getLTP'):
+                try:
+                    option_ltp = uplink_obj.getLTP(option_instrument)
+                except Exception as e:
+                    logger.warning('Unable to fetch option LTP for entry log | instrument=%s | error=%s', option_instrument, e)
+
+            entry_price = float(option_ltp) if option_ltp is not None else float(spot_price)
             Config.POSITION_CONFIG[symbol] = {
                 'option_instrument': option_instrument,
                 'index_instrument': symbol_config['index_instrument'],
@@ -344,7 +514,10 @@ def execute_entry(uplink_obj, symbol, symbol_config, spot_price, option_type, qt
                 'entry_order_id': entry_order_id,
                 'order_status': 'submitted',
             }
-            logger.info('%s entry submitted via V3 order API | order_id=%s | assumed_entry_price=%s', symbol, entry_order_id, entry_price)
+            if option_ltp is not None:
+                logger.info('%s entry submitted via V3 order API | order_id=%s | entry_ltp=%s', symbol, entry_order_id, entry_price)
+            else:
+                logger.info('%s entry submitted via V3 order API | order_id=%s', symbol, entry_order_id)
             return True
 
         for i in range(10):
@@ -396,6 +569,38 @@ def get_candle_close_buffer_seconds():
     return max(0.0, float(Config.STRATEGY_CONFIG.get('CANDLE_CLOSE_BUFFER_SECONDS', 1)))
 
 
+def get_signal_check_timeout_seconds():
+    """Return max allowed runtime for one signal-check cycle before timing out."""
+    return max(5.0, float(Config.STRATEGY_CONFIG.get('SIGNAL_CHECK_TIMEOUT_SECONDS', 120)))
+
+
+def get_max_consecutive_signal_timeouts():
+    """Return max consecutive signal-check timeouts before forcing process exit."""
+    return max(1, int(Config.STRATEGY_CONFIG.get('MAX_CONSECUTIVE_SIGNAL_TIMEOUTS', 5)))
+
+
+def _run_signal_check_with_timeout(uplink_obj):
+    """Execute one signal-check cycle with fail-fast timeout handling."""
+    timeout_seconds = get_signal_check_timeout_seconds()
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(check_entry_signals, uplink_obj)
+    timed_out = False
+    try:
+        future.result(timeout=timeout_seconds)
+        return True
+    except FutureTimeoutError:
+        timed_out = True
+        future.cancel()
+        logger.error('Signal check timed out after %.1fs; skipping this cycle and continuing', timeout_seconds)
+        return False
+    except Exception as exc:
+        logger.exception('Signal check failed with exception: %s', exc)
+        return False
+    finally:
+        # Avoid blocking shutdown on timeout so the main loop can move to the next cycle.
+        executor.shutdown(wait=not timed_out, cancel_futures=timed_out)
+
+
 def get_next_check_time(current_time=None):
     """Return the next timeframe-aligned check time with close-buffer applied."""
     now = current_time or datetime.now(Config.TIME_ZONE)
@@ -416,6 +621,7 @@ def get_next_check_time(current_time=None):
 def main_trading_loop(uplink_obj):
     """Main trading loop."""
     logger.info('Main trading loop started | test_mode=%s', is_test_mode_enabled())
+    consecutive_timeouts = 0
 
     while True:
         test_mode = is_test_mode_enabled()
@@ -436,7 +642,24 @@ def main_trading_loop(uplink_obj):
             continue
 
         logger.info('Starting signal check at %s (scheduled %s)', trigger_time, next_check_time)
-        check_entry_signals(uplink_obj)
+        success = _run_signal_check_with_timeout(uplink_obj)
+        if success:
+            consecutive_timeouts = 0
+            continue
+
+        consecutive_timeouts += 1
+        max_timeouts = get_max_consecutive_signal_timeouts()
+        logger.warning(
+            'Signal-check timeout/failure streak: %s/%s',
+            consecutive_timeouts,
+            max_timeouts,
+        )
+        if consecutive_timeouts >= max_timeouts:
+            logger.critical(
+                'Exceeded maximum consecutive signal-check timeouts (%s). Exiting process for external restart.',
+                max_timeouts,
+            )
+            raise RuntimeError('Signal-check timeout threshold exceeded')
 
 
 if __name__ == '__main__':
@@ -464,6 +687,7 @@ if __name__ == '__main__':
     # Runtime always uses Upstox API; MockUplink is intended for unit tests only.
     Config.UPLINK_OBJ = UpstoxApi(accessToken=Config.ACCESS_TOKEN)
     uplink_obj = Config.UPLINK_OBJ
+    initialize_runtime_state(uplink_obj)
     
     logger.info('Starting NIFTY Option Selling Intraday Strategy')
     main_trading_loop(uplink_obj)

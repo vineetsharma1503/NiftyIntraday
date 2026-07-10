@@ -1,11 +1,22 @@
 import unittest
+import tempfile
+import os
+from types import SimpleNamespace
 from datetime import datetime
 from unittest.mock import patch
 
 import pandas as pd
 
 import Config
-from main import check_entry_signals, get_next_check_time, main_trading_loop, is_trading_time
+from main import (
+    _persist_daily_entry_counts_to_config,
+    _run_signal_check_with_timeout,
+    check_entry_signals,
+    get_next_check_time,
+    initialize_runtime_state,
+    is_trading_time,
+    main_trading_loop,
+)
 
 
 class MainLoopTests(unittest.TestCase):
@@ -52,6 +63,83 @@ class MainLoopTests(unittest.TestCase):
              patch('main.datetime') as mock_datetime:
             mock_datetime.now.return_value = off_hours
             self.assertTrue(is_trading_time())
+
+    def test_initialize_runtime_state_loads_entry_counts_once(self):
+        uplink = SimpleNamespace(getPositionBook=lambda: {'data': []})
+        with patch('main.Config.PERSISTED_DAILY_ENTRY_COUNTS', {'2026-07-10': {'NIFTY': 2}}, create=True), \
+             patch('main.Config.DAILY_ENTRY_COUNTS', {}, create=True), \
+             patch('main.Config._DAILY_ENTRY_COUNTS_LOADED', False, create=True), \
+             patch('main.Config.POSITION_CONFIG', {}, create=True):
+            initialize_runtime_state(uplink)
+            self.assertEqual(Config.DAILY_ENTRY_COUNTS.get('2026-07-10', {}).get('NIFTY'), 2)
+
+            Config.PERSISTED_DAILY_ENTRY_COUNTS = {'2026-07-10': {'NIFTY': 7}}
+            initialize_runtime_state(uplink)
+            self.assertEqual(Config.DAILY_ENTRY_COUNTS.get('2026-07-10', {}).get('NIFTY'), 2)
+
+    def test_initialize_runtime_state_syncs_open_short_nifty_option(self):
+        uplink = SimpleNamespace(
+            getPositionBook=lambda: {
+                'data': [
+                    {
+                        'instrument_token': 'NFO_OPT|NIFTY25JUL24500PE',
+                        'trading_symbol': 'NIFTY25JUL24500PE',
+                        'quantity': -75,
+                        'average_price': 120.5,
+                    }
+                ]
+            }
+        )
+
+        with patch('main.Config.PERSISTED_DAILY_ENTRY_COUNTS', {}, create=True), \
+             patch('main.Config.DAILY_ENTRY_COUNTS', {}, create=True), \
+             patch('main.Config._DAILY_ENTRY_COUNTS_LOADED', False, create=True), \
+             patch('main.Config.POSITION_CONFIG', {}, create=True), \
+             patch('main.Config.NIFTY_CONFIG', {'index_instrument': 'NSE_INDEX|Nifty 50', 'lot_size': 75, 'enable': True}, create=True):
+            initialize_runtime_state(uplink)
+            self.assertIn('NIFTY', Config.POSITION_CONFIG)
+            self.assertEqual(Config.POSITION_CONFIG['NIFTY']['option_type'], 'PE')
+            self.assertEqual(Config.POSITION_CONFIG['NIFTY']['qty'], 75)
+            self.assertEqual(Config.POSITION_CONFIG['NIFTY']['entry_price'], 120.5)
+
+    def test_persist_daily_entry_counts_updates_config_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config_path = os.path.join(tmp_dir, 'Config.py')
+            with open(config_path, 'w', encoding='utf-8') as file_obj:
+                file_obj.write(
+                    "PERSISTED_DAILY_ENTRY_COUNTS = {}\n"
+                    "DAILY_ENTRY_COUNTS = {}\n"
+                )
+
+            counts = {'2026-07-10': {'NIFTY': 3}}
+            with patch('main.Config.__file__', config_path, create=True):
+                _persist_daily_entry_counts_to_config(counts)
+
+            with open(config_path, 'r', encoding='utf-8') as file_obj:
+                updated = file_obj.read()
+
+            self.assertIn('PERSISTED_DAILY_ENTRY_COUNTS = {"2026-07-10": {"NIFTY": 3}}', updated)
+
+    def test_run_signal_check_with_timeout_returns_false_when_blocked(self):
+        def _blocked_check(_uplink):
+            import time
+            time.sleep(0.2)
+
+        with patch('main.check_entry_signals', side_effect=_blocked_check), \
+             patch('main.get_signal_check_timeout_seconds', return_value=0.05):
+            self.assertFalse(_run_signal_check_with_timeout(object()))
+
+    def test_main_trading_loop_raises_after_timeout_threshold(self):
+        with patch('main.Config.STRATEGY_CONFIG', {
+                'TEST_MODE': True,
+                'TIMEFRAME': 5,
+                'CANDLE_CLOSE_BUFFER_SECONDS': 1,
+                'MAX_CONSECUTIVE_SIGNAL_TIMEOUTS': 2,
+            }), \
+             patch('main._run_signal_check_with_timeout', return_value=False), \
+             patch('main.sleep', return_value=None):
+            with self.assertRaises(RuntimeError):
+                main_trading_loop(object())
 
 
 if __name__ == '__main__':

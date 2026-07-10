@@ -63,6 +63,17 @@ class StrategyLogicTests(unittest.TestCase):
         self.assertEqual(result['action'], 'exit')
         self.assertEqual(result['option_type'], 'PE')
 
+    def test_hold_signal_when_position_open_and_exit_not_met(self):
+        candle_data = pd.DataFrame([
+            {'high': 100, 'low': 90, 'close': 95},
+            {'high': 104, 'low': 96, 'close': 102},
+        ])
+
+        result = evaluate_strategy_signal(candle_data, position_open=True, position_option_type='PE')
+
+        self.assertEqual(result['action'], 'hold')
+        self.assertEqual(result['option_type'], 'PE')
+
     def test_logs_strategy_decision_details(self):
         candle_data = pd.DataFrame([
             {'high': 100, 'low': 90, 'close': 95},

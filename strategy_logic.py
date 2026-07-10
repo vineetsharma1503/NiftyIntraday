@@ -75,12 +75,11 @@ def evaluate_strategy_signal(
     latest_direction = int(indicator.iloc[-1]['supertrend_direction'])
     latest_supertrend = float(indicator.iloc[-1]['supertrend'])
     logger.info(
-        'Strategy supertrend calculation | length=%s | multiplier=%s | latest_direction=%s | latest_supertrend=%.2f | indicator_tail=%s',
+        'Strategy supertrend calculation | length=%s | multiplier=%s | latest_direction=%s | latest_supertrend=%.2f',
         st_length,
         st_multiplier,
         latest_direction,
         latest_supertrend,
-        indicator.tail(3).to_dict(orient='records'),
     )
 
     decision = {'action': 'none', 'option_type': None, 'lots': lots}
@@ -112,6 +111,17 @@ def evaluate_strategy_signal(
                     decision,
                 )
                 return decision
+
+        decision = {'action': 'hold', 'option_type': position_option_type, 'lots': lots}
+        logger.info(
+            'Strategy decision | latest_close=%.2f | r1=%.2f | s1=%.2f | supertrend_direction=%s | decision=%s',
+            latest_close,
+            r1,
+            s1,
+            latest_direction,
+            decision,
+        )
+        return decision
 
     if entry_count >= max_entries:
         logger.info(

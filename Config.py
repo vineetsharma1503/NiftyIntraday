@@ -24,6 +24,8 @@ STRATEGY_CONFIG = {
     'MAX_ENTRIES': 3,            # Maximum number of entries per day
     'SUPERTREND_LENGTH': 7,     # Supertrend ATR period (TradingView default)
     'SUPERTREND_MULTIPLIER': 3.0,  # Supertrend ATR multiplier
+    'SIGNAL_CHECK_TIMEOUT_SECONDS': 120,  # Fail fast if one signal cycle blocks too long
+    'MAX_CONSECUTIVE_SIGNAL_TIMEOUTS': 5,  # Exit process after repeated timeouts
     
     
     # Option Selection
@@ -66,6 +68,10 @@ ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.e
 UPLINK_OBJ = None
 POSITION_CONFIG = {}
 CANDLE_DATA_CACHE = {}
+# Persist today's entry counters here if you want restart-safe max-entry tracking.
+# Example: {'2026-07-10': {'NIFTY': 1}}
+PERSISTED_DAILY_ENTRY_COUNTS = {}
+DAILY_ENTRY_COUNTS = {}
 
 # Legacy variables for backward compatibility (will be removed)
 RURL = 'https://127.0.0.1:5000/'
