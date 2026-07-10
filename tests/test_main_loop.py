@@ -2,7 +2,7 @@ import unittest
 import tempfile
 import os
 from types import SimpleNamespace
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import pandas as pd
@@ -16,6 +16,7 @@ from main import (
     initialize_runtime_state,
     is_trading_time,
     main_trading_loop,
+    should_log_pivot_this_cycle,
 )
 
 
@@ -248,6 +249,32 @@ class MainLoopTests(unittest.TestCase):
              patch('main.sleep', return_value=None):
             with self.assertRaises(RuntimeError):
                 main_trading_loop(object())
+
+    def test_main_trading_loop_squares_off_at_end_time(self):
+        before_end_dt = Config.TIME_ZONE.localize(datetime(2026, 7, 10, 15, 10, 1))
+        uplink = SimpleNamespace(exit_all=lambda: None)
+
+        with patch('main.Config.STRATEGY_CONFIG', {'TEST_MODE': False, 'TIMEFRAME': 5, 'CANDLE_CLOSE_BUFFER_SECONDS': 1}), \
+             patch('main.datetime') as mock_datetime, \
+             patch('main.get_next_check_time', return_value=before_end_dt + timedelta(minutes=5)), \
+             patch('main.has_reached_trading_end', side_effect=[False, True]), \
+             patch('main.sleep', return_value=None), \
+             patch.object(uplink, 'exit_all') as mock_exit_all, \
+             patch('main._run_signal_check_with_timeout') as mock_run_check:
+            mock_datetime.now.return_value = before_end_dt
+
+            main_trading_loop(uplink)
+
+        mock_exit_all.assert_called_once()
+        mock_run_check.assert_not_called()
+
+    def test_should_log_pivot_every_12th_iteration(self):
+        with patch('main.Config.STRATEGY_CONFIG', {'PIVOT_LOG_INTERVAL_ITERATIONS': 12}, create=True), \
+             patch('main.Config.SIGNAL_CHECK_ITERATION_COUNT', 0, create=True):
+            results = [should_log_pivot_this_cycle() for _ in range(12)]
+
+        self.assertFalse(any(results[:11]))
+        self.assertTrue(results[11])
 
 
 if __name__ == '__main__':

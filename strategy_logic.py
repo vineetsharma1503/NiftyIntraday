@@ -19,6 +19,7 @@ def evaluate_strategy_signal(
     entry_count: int = 0,
     lots: int = 1,
     max_entries: int = 3,
+    log_pivot_details: bool = True,
 ) -> dict:
     """Evaluate the entry/exit signal for the configured strategy.
 
@@ -52,19 +53,21 @@ def evaluate_strategy_signal(
     if pivot_levels is None:
         pivot_row = frame.iloc[-2] if len(frame) > 1 else latest_row
         pivot_levels = calculate_daily_pivot_levels_from_candles(pd.DataFrame([pivot_row.to_dict()]))
-        logger.info(
-            'Strategy pivot calculation | source=intraday_fallback | latest_close=%.2f | pivot_row=%s | r1=%.2f | s1=%.2f',
-            latest_close,
-            pivot_row.to_dict(),
-            pivot_levels['r1'],
-            pivot_levels['s1'],
-        )
+        if log_pivot_details:
+            logger.info(
+                'Strategy pivot calculation | source=intraday_fallback | latest_close=%.2f | pivot_row=%s | r1=%.2f | s1=%.2f',
+                latest_close,
+                pivot_row.to_dict(),
+                pivot_levels['r1'],
+                pivot_levels['s1'],
+            )
     else:
-        logger.info(
-            'Strategy pivot calculation | source=daily_previous_session | latest_close=%.2f | pivot_levels=%s',
-            latest_close,
-            pivot_levels,
-        )
+        if log_pivot_details:
+            logger.info(
+                'Strategy pivot calculation | source=daily_previous_session | latest_close=%.2f | pivot_levels=%s',
+                latest_close,
+                pivot_levels,
+            )
 
     r1 = float(pivot_levels['r1'])
     s1 = float(pivot_levels['s1'])

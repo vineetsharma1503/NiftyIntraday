@@ -26,6 +26,7 @@ STRATEGY_CONFIG = {
     'SUPERTREND_MULTIPLIER': 3.0,  # Supertrend ATR multiplier
     'SIGNAL_CHECK_TIMEOUT_SECONDS': 120,  # Fail fast if one signal cycle blocks too long
     'MAX_CONSECUTIVE_SIGNAL_TIMEOUTS': 5,  # Exit process after repeated timeouts
+    'PIVOT_LOG_INTERVAL_ITERATIONS': 12,  # Log pivot details every 12 signal checks (~hourly at 5m)
     
     
     # Option Selection
@@ -55,7 +56,7 @@ NIFTY_CONFIG = {
 # Trading Schedule
 TRADING_HOURS = {
     'START': (9, 15, 0),         # Market start: 9:15 AM
-    'END': (15, 19, 0),          # Auto exit: 3:25 PM (5 min before close)
+    'END': (15, 15, 0),          # Auto exit: 3:25 PM (5 min before close)
 }
 
 # Order Configuration

@@ -128,6 +128,18 @@ def is_trading_time():
     return start_time <= current_time < exit_time
 
 
+def has_reached_trading_end(current_time=None):
+    """Return True once local clock reaches configured trading end time."""
+    now = current_time or datetime.now(Config.TIME_ZONE)
+    exit_time = now.replace(
+        hour=Config.TRADING_HOURS['END'][0],
+        minute=Config.TRADING_HOURS['END'][1],
+        second=0,
+        microsecond=0,
+    )
+    return now >= exit_time
+
+
 def check_stop_loss_target(uplink_obj, symbol, position_config):
     """Check if stop loss or target is hit"""
     try:
@@ -546,6 +558,7 @@ def _get_fixed_daily_pivot_levels(uplink_obj, symbol, instrument_key):
 def check_entry_signals(uplink_obj):
     """Main signal checking logic based on pivot and Supertrend rules."""
     logger.info(f'Position Config: {Config.POSITION_CONFIG}')
+    log_pivot_details = should_log_pivot_this_cycle()
 
     symbol = 'NIFTY'
     symbol_config = Config.NIFTY_CONFIG
@@ -574,6 +587,7 @@ def check_entry_signals(uplink_obj):
             entry_count=_get_daily_entry_count(symbol),
             lots=lots,
             max_entries=max_entries,
+            log_pivot_details=log_pivot_details,
         )
         if signal.get('action') == 'exit':
             exit_position(uplink_obj, symbol, int(position_config.get('qty', 0)))
@@ -587,6 +601,7 @@ def check_entry_signals(uplink_obj):
         entry_count=_get_daily_entry_count(symbol),
         lots=lots,
         max_entries=max_entries,
+        log_pivot_details=log_pivot_details,
     )
     if signal.get('action') == 'enter':
         option_type = signal.get('option_type')
@@ -735,6 +750,14 @@ def get_max_consecutive_signal_timeouts():
     return max(1, int(Config.STRATEGY_CONFIG.get('MAX_CONSECUTIVE_SIGNAL_TIMEOUTS', 5)))
 
 
+def should_log_pivot_this_cycle():
+    """Return True every configured Nth signal-check cycle to reduce pivot log noise."""
+    interval = max(1, int(Config.STRATEGY_CONFIG.get('PIVOT_LOG_INTERVAL_ITERATIONS', 12)))
+    current_count = int(getattr(Config, 'SIGNAL_CHECK_ITERATION_COUNT', 0)) + 1
+    setattr(Config, 'SIGNAL_CHECK_ITERATION_COUNT', current_count)
+    return current_count % interval == 0
+
+
 def _run_signal_check_with_timeout(uplink_obj):
     """Execute one signal-check cycle with fail-fast timeout handling."""
     timeout_seconds = get_signal_check_timeout_seconds()
@@ -782,6 +805,15 @@ def main_trading_loop(uplink_obj):
     while True:
         test_mode = is_test_mode_enabled()
         current_time = datetime.now(Config.TIME_ZONE)
+
+        if not test_mode and has_reached_trading_end(current_time):
+            logger.info('Trading end reached at %s; squaring off all positions and stopping loop', current_time)
+            try:
+                uplink_obj.exit_all()
+            except Exception as exc:
+                logger.exception('Failed to square off positions at trading end: %s', exc)
+            break
+
         if not test_mode and not is_trading_time():
             logger.info('Outside trading hours at %s; waiting for next cycle', current_time)
             sleep(get_sync_time())
@@ -793,6 +825,14 @@ def main_trading_loop(uplink_obj):
         sleep(wait_seconds)
 
         trigger_time = datetime.now(Config.TIME_ZONE)
+        if not test_mode and has_reached_trading_end(trigger_time):
+            logger.info('Trading end reached at check trigger %s; squaring off all positions and stopping loop', trigger_time)
+            try:
+                uplink_obj.exit_all()
+            except Exception as exc:
+                logger.exception('Failed to square off positions at trading end trigger: %s', exc)
+            break
+
         if not test_mode and not is_trading_time():
             logger.info('Skipped signal check at %s due to trading window', trigger_time)
             continue
@@ -833,6 +873,17 @@ if __name__ == '__main__':
             sleep(wait_time)
     
     logger.info('Starting strategy entrypoint | current_time=%s | test_mode=%s', datetime.now(Config.TIME_ZONE), is_test_mode_enabled())
+    logger.info(
+        'Configured trading window | start=%02d:%02d:%02d | end=%02d:%02d:%02d | timeframe=%s minutes | pivot_log_interval_iterations=%s',
+        Config.TRADING_HOURS['START'][0],
+        Config.TRADING_HOURS['START'][1],
+        Config.TRADING_HOURS['START'][2],
+        Config.TRADING_HOURS['END'][0],
+        Config.TRADING_HOURS['END'][1],
+        Config.TRADING_HOURS['END'][2],
+        Config.STRATEGY_CONFIG.get('TIMEFRAME', 5),
+        Config.STRATEGY_CONFIG.get('PIVOT_LOG_INTERVAL_ITERATIONS', 12),
+    )
 
     try:
         Utility.initialize_system()
