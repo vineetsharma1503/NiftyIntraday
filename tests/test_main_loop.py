@@ -16,6 +16,7 @@ from main import (
     initialize_runtime_state,
     is_trading_time,
     main_trading_loop,
+    square_off_tracked_positions,
     should_log_pivot_this_cycle,
 )
 
@@ -252,21 +253,32 @@ class MainLoopTests(unittest.TestCase):
 
     def test_main_trading_loop_squares_off_at_end_time(self):
         before_end_dt = Config.TIME_ZONE.localize(datetime(2026, 7, 10, 15, 10, 1))
-        uplink = SimpleNamespace(exit_all=lambda: None)
+        uplink = SimpleNamespace(closePosition=lambda *_args, **_kwargs: 'close-order-id')
 
         with patch('main.Config.STRATEGY_CONFIG', {'TEST_MODE': False, 'TIMEFRAME': 5, 'CANDLE_CLOSE_BUFFER_SECONDS': 1}), \
+             patch('main.Config.POSITION_CONFIG', {'NIFTY': {'option_instrument': 'NFO_OPT|NIFTY25JUL24500PE', 'qty': 75}}, create=True), \
              patch('main.datetime') as mock_datetime, \
              patch('main.get_next_check_time', return_value=before_end_dt + timedelta(minutes=5)), \
              patch('main.has_reached_trading_end', side_effect=[False, True]), \
              patch('main.sleep', return_value=None), \
-             patch.object(uplink, 'exit_all') as mock_exit_all, \
+             patch.object(uplink, 'closePosition') as mock_close_position, \
              patch('main._run_signal_check_with_timeout') as mock_run_check:
             mock_datetime.now.return_value = before_end_dt
 
             main_trading_loop(uplink)
 
-        mock_exit_all.assert_called_once()
+        mock_close_position.assert_called_once_with('NFO_OPT|NIFTY25JUL24500PE', 75, 'BUY')
         mock_run_check.assert_not_called()
+
+    def test_square_off_tracked_positions_noop_when_empty(self):
+        uplink = SimpleNamespace(closePosition=lambda *_args, **_kwargs: 'close-order-id')
+
+        with patch('main.Config.POSITION_CONFIG', {}, create=True), \
+             patch.object(uplink, 'closePosition') as mock_close_position:
+            closed = square_off_tracked_positions(uplink, 'test-context')
+
+        self.assertEqual(closed, 0)
+        mock_close_position.assert_not_called()
 
     def test_should_log_pivot_every_12th_iteration(self):
         with patch('main.Config.STRATEGY_CONFIG', {'PIVOT_LOG_INTERVAL_ITERATIONS': 12}, create=True), \

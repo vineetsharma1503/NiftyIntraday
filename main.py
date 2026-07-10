@@ -758,6 +758,44 @@ def should_log_pivot_this_cycle():
     return current_count % interval == 0
 
 
+def square_off_tracked_positions(uplink_obj, context_message=''):
+    """Square off only strategy-tracked open positions and skip when none exist."""
+    tracked_positions = getattr(Config, 'POSITION_CONFIG', {})
+    if not isinstance(tracked_positions, dict) or not tracked_positions:
+        if context_message:
+            logger.info('%s | no tracked strategy positions to square off', context_message)
+        else:
+            logger.info('No tracked strategy positions to square off')
+        return 0
+
+    closed_count = 0
+    for symbol, position in list(tracked_positions.items()):
+        option_instrument = str(position.get('option_instrument', '') or '').strip()
+        qty = int(position.get('qty', 0) or 0)
+        if not option_instrument or qty <= 0:
+            logger.warning(
+                'Skipping tracked square-off for %s due to invalid position config: %s',
+                symbol,
+                position,
+            )
+            Config.POSITION_CONFIG.pop(symbol, None)
+            continue
+
+        try:
+            uplink_obj.closePosition(option_instrument, qty, 'BUY')
+            Config.POSITION_CONFIG.pop(symbol, None)
+            closed_count += 1
+            logger.info('Square-off submitted for %s | instrument=%s | qty=%s', symbol, option_instrument, qty)
+        except Exception as exc:
+            logger.exception('Failed to square off tracked position for %s: %s', symbol, exc)
+
+    if context_message:
+        logger.info('%s | tracked strategy square-off complete | closed=%s', context_message, closed_count)
+    else:
+        logger.info('Tracked strategy square-off complete | closed=%s', closed_count)
+    return closed_count
+
+
 def _run_signal_check_with_timeout(uplink_obj):
     """Execute one signal-check cycle with fail-fast timeout handling."""
     timeout_seconds = get_signal_check_timeout_seconds()
@@ -809,7 +847,7 @@ def main_trading_loop(uplink_obj):
         if not test_mode and has_reached_trading_end(current_time):
             logger.info('Trading end reached at %s; squaring off all positions and stopping loop', current_time)
             try:
-                uplink_obj.exit_all()
+                square_off_tracked_positions(uplink_obj, f'Trading end reached at {current_time}')
             except Exception as exc:
                 logger.exception('Failed to square off positions at trading end: %s', exc)
             break
@@ -828,7 +866,7 @@ def main_trading_loop(uplink_obj):
         if not test_mode and has_reached_trading_end(trigger_time):
             logger.info('Trading end reached at check trigger %s; squaring off all positions and stopping loop', trigger_time)
             try:
-                uplink_obj.exit_all()
+                square_off_tracked_positions(uplink_obj, f'Trading end reached at check trigger {trigger_time}')
             except Exception as exc:
                 logger.exception('Failed to square off positions at trading end trigger: %s', exc)
             break
@@ -900,4 +938,4 @@ if __name__ == '__main__':
     main_trading_loop(uplink_obj)
     
     logger.info('Market closed - Squaring off all positions')
-    uplink_obj.exit_all()
+    square_off_tracked_positions(uplink_obj, 'Post-loop market close handler')
