@@ -164,7 +164,15 @@ class UpstoxApi:
         """Get order book"""
         try:
             if self._use_v3_order_api():
-                return self._v3_request('GET', '/v3/order/retrieve-all')
+                try:
+                    return self._v3_request('GET', '/v3/order/retrieve-all')
+                except RuntimeError as v3_err:
+                    # Some accounts/environments do not expose this v3 route.
+                    msg = str(v3_err).lower()
+                    if '404' in msg or 'resource not found' in msg or 'udapi100060' in msg:
+                        logger.warning('V3 order book endpoint unavailable; falling back to v2 order book API. Error: %s', v3_err)
+                    else:
+                        raise
             order_book_response = self.order_instance.get_order_book(self.api_version)
             return order_book_response.to_dict()
         except Exception as e:

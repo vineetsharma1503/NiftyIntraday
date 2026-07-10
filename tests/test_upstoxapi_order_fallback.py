@@ -21,6 +21,10 @@ class _DummyOrderInstance:
         self.calls.append((order_payload, api_version))
         return _DummyResponse(self.payload)
 
+    def get_order_book(self, api_version):
+        self.calls.append(('get_order_book', api_version))
+        return _DummyResponse(self.payload)
+
 
 class UpstoxApiOrderFallbackTests(unittest.TestCase):
     def _make_api(self):
@@ -57,6 +61,20 @@ class UpstoxApiOrderFallbackTests(unittest.TestCase):
         self.assertEqual(order_id, 'v2-order-123')
         self.assertTrue(api._force_v2_order_api)
         self.assertEqual(len(api.order_instance.calls), 1)
+
+    def test_get_order_book_falls_back_to_v2_when_v3_route_missing(self):
+        api = self._make_api()
+        api.order_instance = _DummyOrderInstance({'status': 'success', 'data': [{'order_id': 'abc'}]})
+        api._v3_request = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError('V3 API HTTP 404 Not Found: {"errors":[{"errorCode":"UDAPI100060","message":"Resource not Found."}]}')
+        )
+
+        with patch('upstoxapi.Config.STRATEGY_CONFIG', {'UPSTOX_ORDER_API_VERSION': 'v3'}):
+            payload = api.getOrderBook()
+
+        self.assertIsInstance(payload, dict)
+        self.assertEqual(payload.get('status'), 'success')
+        self.assertEqual(payload.get('data', [{}])[0].get('order_id'), 'abc')
 
 
 if __name__ == '__main__':

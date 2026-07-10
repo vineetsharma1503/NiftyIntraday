@@ -102,6 +102,114 @@ class MainLoopTests(unittest.TestCase):
             self.assertEqual(Config.POSITION_CONFIG['NIFTY']['qty'], 75)
             self.assertEqual(Config.POSITION_CONFIG['NIFTY']['entry_price'], 120.5)
 
+    def test_initialize_runtime_state_prefers_strategy_tagged_order_token(self):
+        uplink = SimpleNamespace(
+            getPositionBook=lambda: {
+                'data': [
+                    {
+                        'instrument_token': 'NFO_OPT|NIFTY25JUL24450CE',
+                        'trading_symbol': 'NIFTY25JUL24450CE',
+                        'quantity': -150,
+                        'average_price': 180.0,
+                        'product': 'I',
+                    },
+                    {
+                        'instrument_token': 'NFO_OPT|NIFTY25JUL24500PE',
+                        'trading_symbol': 'NIFTY25JUL24500PE',
+                        'quantity': -75,
+                        'average_price': 120.5,
+                        'product': 'I',
+                    },
+                ]
+            },
+            getOrderBook=lambda: {
+                'data': [
+                    {
+                        'instrument_token': 'NFO_OPT|NIFTY25JUL24500PE',
+                        'status': 'complete',
+                        'transaction_type': 'SELL',
+                        'product': 'I',
+                        'tag': 'STRATEGY_NIFTY_INTRADAY',
+                    }
+                ]
+            },
+        )
+
+        with patch('main.Config.PERSISTED_DAILY_ENTRY_COUNTS', {}, create=True), \
+             patch('main.Config.DAILY_ENTRY_COUNTS', {}, create=True), \
+             patch('main.Config._DAILY_ENTRY_COUNTS_LOADED', False, create=True), \
+             patch('main.Config.POSITION_CONFIG', {}, create=True), \
+             patch('main.Config.ORDER_TAG', 'STRATEGY_NIFTY_INTRADAY', create=True), \
+             patch('main.Config.ORDER_TYPE', 'I', create=True), \
+             patch('main.Config.NIFTY_CONFIG', {'index_instrument': 'NSE_INDEX|Nifty 50', 'lot_size': 75, 'enable': True}, create=True):
+            initialize_runtime_state(uplink)
+            self.assertIn('NIFTY', Config.POSITION_CONFIG)
+            self.assertEqual(Config.POSITION_CONFIG['NIFTY']['option_instrument'], 'NFO_OPT|NIFTY25JUL24500PE')
+            self.assertEqual(Config.POSITION_CONFIG['NIFTY']['qty'], 75)
+
+    def test_initialize_runtime_state_filters_delivery_when_strategy_is_intraday(self):
+        uplink = SimpleNamespace(
+            getPositionBook=lambda: {
+                'data': [
+                    {
+                        'instrument_token': 'NFO_OPT|NIFTY25JUL24450CE',
+                        'trading_symbol': 'NIFTY25JUL24450CE',
+                        'quantity': -150,
+                        'average_price': 180.0,
+                        'product': 'D',
+                    },
+                    {
+                        'instrument_token': 'NFO_OPT|NIFTY25JUL24500PE',
+                        'trading_symbol': 'NIFTY25JUL24500PE',
+                        'quantity': -75,
+                        'average_price': 120.5,
+                        'product': 'I',
+                    },
+                ]
+            }
+        )
+
+        with patch('main.Config.PERSISTED_DAILY_ENTRY_COUNTS', {}, create=True), \
+             patch('main.Config.DAILY_ENTRY_COUNTS', {}, create=True), \
+             patch('main.Config._DAILY_ENTRY_COUNTS_LOADED', False, create=True), \
+             patch('main.Config.POSITION_CONFIG', {}, create=True), \
+             patch('main.Config.ORDER_TAG', 'STRATEGY_NIFTY_INTRADAY', create=True), \
+             patch('main.Config.ORDER_TYPE', 'I', create=True), \
+             patch('main.Config.NIFTY_CONFIG', {'index_instrument': 'NSE_INDEX|Nifty 50', 'lot_size': 75, 'enable': True}, create=True):
+            initialize_runtime_state(uplink)
+            self.assertIn('NIFTY', Config.POSITION_CONFIG)
+            self.assertEqual(Config.POSITION_CONFIG['NIFTY']['option_instrument'], 'NFO_OPT|NIFTY25JUL24500PE')
+            self.assertEqual(Config.POSITION_CONFIG['NIFTY']['qty'], 75)
+
+    def test_initialize_runtime_state_derives_entry_price_from_sell_value(self):
+        uplink = SimpleNamespace(
+            getPositionBook=lambda: {
+                'data': [
+                    {
+                        'instrument_token': 'NFO_OPT|NIFTY25JUL24500PE',
+                        'trading_symbol': 'NIFTY25JUL24500PE',
+                        'quantity': -75,
+                        'average_price': 0,
+                        'sell_price': 0,
+                        'sell_value': 9150,
+                        'product': 'I',
+                    }
+                ]
+            },
+            getLTP=lambda _instrument: 130.0,
+        )
+
+        with patch('main.Config.PERSISTED_DAILY_ENTRY_COUNTS', {}, create=True), \
+             patch('main.Config.DAILY_ENTRY_COUNTS', {}, create=True), \
+             patch('main.Config._DAILY_ENTRY_COUNTS_LOADED', False, create=True), \
+             patch('main.Config.POSITION_CONFIG', {}, create=True), \
+             patch('main.Config.ORDER_TAG', 'STRATEGY_NIFTY_INTRADAY', create=True), \
+             patch('main.Config.ORDER_TYPE', 'I', create=True), \
+             patch('main.Config.NIFTY_CONFIG', {'index_instrument': 'NSE_INDEX|Nifty 50', 'lot_size': 75, 'enable': True}, create=True):
+            initialize_runtime_state(uplink)
+            self.assertIn('NIFTY', Config.POSITION_CONFIG)
+            self.assertAlmostEqual(Config.POSITION_CONFIG['NIFTY']['entry_price'], 122.0)
+
     def test_persist_daily_entry_counts_updates_config_file(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = os.path.join(tmp_dir, 'Config.py')

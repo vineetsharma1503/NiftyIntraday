@@ -254,6 +254,130 @@ def _infer_option_type(position_row):
     return None
 
 
+def _normalize_product_code(product_value):
+    """Normalize broker product value to strategy-style short codes."""
+    value = str(product_value or '').strip().upper()
+    if value in {'I', 'INTRADAY', 'MIS'}:
+        return 'I'
+    if value in {'D', 'DELIVERY', 'CNC'}:
+        return 'D'
+    return value
+
+
+def _row_has_expected_tag(row, expected_tag):
+    """Return True when a broker row carries the configured strategy tag."""
+    if not expected_tag or not isinstance(row, dict):
+        return False
+
+    normalized_expected = str(expected_tag).strip().upper()
+    tag_fields = [row.get('tag'), row.get('order_tag')]
+    for value in tag_fields:
+        if str(value or '').strip().upper() == normalized_expected:
+            return True
+
+    tags = row.get('tags')
+    if isinstance(tags, list):
+        return any(str(tag or '').strip().upper() == normalized_expected for tag in tags)
+
+    return False
+
+
+def _get_strategy_order_tokens(uplink_obj):
+    """Collect instrument tokens from completed strategy-tagged entry orders."""
+    if not hasattr(uplink_obj, 'getOrderBook'):
+        return set()
+
+    try:
+        order_book = uplink_obj.getOrderBook()
+    except Exception as exc:
+        logger.exception('Order book fetch failed during startup position sync: %s', exc)
+        return set()
+
+    if not isinstance(order_book, dict):
+        return set()
+
+    orders = order_book.get('data', [])
+    if not isinstance(orders, list):
+        return set()
+
+    expected_tag = str(getattr(Config, 'ORDER_TAG', '') or '').strip().upper()
+    expected_product = _normalize_product_code(getattr(Config, 'ORDER_TYPE', ''))
+    completed_statuses = {'COMPLETE', 'COMPLETED', 'TRADED', 'FILLED'}
+    tokens = set()
+
+    for row in orders:
+        if not isinstance(row, dict):
+            continue
+
+        if expected_tag and not _row_has_expected_tag(row, expected_tag):
+            continue
+
+        status = str(row.get('status', '') or '').strip().upper()
+        if status and status not in completed_statuses:
+            continue
+
+        trans_type = str(row.get('transaction_type', '') or '').strip().upper()
+        if trans_type and trans_type != 'SELL':
+            continue
+
+        order_product = _normalize_product_code(row.get('product', row.get('product_type', '')))
+        if expected_product and order_product and order_product != expected_product:
+            continue
+
+        token = str(row.get('instrument_token', row.get('instrument_key', '')) or '').strip()
+        if token:
+            tokens.add(token)
+
+    return tokens
+
+
+def _to_positive_float(value):
+    """Convert value to a positive float, or None when not usable."""
+    try:
+        parsed = float(value)
+    except Exception:
+        return None
+    if parsed > 0:
+        return parsed
+    return None
+
+
+def _resolve_entry_price_from_position(uplink_obj, row, qty, option_instrument):
+    """Resolve entry price from broker position fields with practical fallbacks."""
+    direct_price_fields = [
+        'average_price',
+        'avg_price',
+        'sell_price',
+        'day_sell_price',
+        'overnight_sell_price',
+        'last_price',
+        'ltp',
+    ]
+    for field in direct_price_fields:
+        value = _to_positive_float(row.get(field))
+        if value is not None:
+            return value
+
+    if qty > 0:
+        # Some position payloads expose only value fields, not average_price.
+        value_fields = ['sell_value', 'day_sell_value', 'overnight_sell_value']
+        for field in value_fields:
+            value = _to_positive_float(row.get(field))
+            if value is not None:
+                return value / float(qty)
+
+    if hasattr(uplink_obj, 'getLTP'):
+        try:
+            ltp = _to_positive_float(uplink_obj.getLTP(option_instrument))
+            if ltp is not None:
+                logger.info('Startup position sync entry price fallback used LTP for %s: %.2f', option_instrument, ltp)
+                return ltp
+        except Exception as exc:
+            logger.warning('Startup position sync could not fetch LTP fallback for %s: %s', option_instrument, exc)
+
+    return 0.0
+
+
 def _sync_position_config_from_broker(uplink_obj):
     """Populate runtime POSITION_CONFIG from existing broker positions."""
     symbol = 'NIFTY'
@@ -276,6 +400,10 @@ def _sync_position_config_from_broker(uplink_obj):
         logger.warning('Position sync skipped: unexpected data in position book payload')
         return
 
+    expected_product = _normalize_product_code(getattr(Config, 'ORDER_TYPE', ''))
+    expected_tag = str(getattr(Config, 'ORDER_TAG', '') or '').strip().upper()
+    strategy_order_tokens = _get_strategy_order_tokens(uplink_obj)
+
     candidates = []
     for row in positions:
         if not isinstance(row, dict):
@@ -289,6 +417,11 @@ def _sync_position_config_from_broker(uplink_obj):
 
         option_type = _infer_option_type(row)
         if option_type not in {'CE', 'PE'}:
+            continue
+
+        position_product = _normalize_product_code(row.get('product', row.get('product_type', '')))
+        if expected_product and position_product and position_product != expected_product:
+            # Avoid matching unrelated delivery positions when strategy is intraday.
             continue
 
         try:
@@ -306,17 +439,40 @@ def _sync_position_config_from_broker(uplink_obj):
         logger.info('No open short NIFTY option position found in broker book during startup sync')
         return
 
-    selected_row, option_type, qty = max(candidates, key=lambda item: item[2])
+    tagged_position_candidates = [
+        candidate for candidate in candidates
+        if _row_has_expected_tag(candidate[0], expected_tag)
+    ]
 
-    entry_price = selected_row.get('average_price')
-    if entry_price is None:
-        entry_price = selected_row.get('sell_price', selected_row.get('buy_price', 0))
-    try:
-        entry_price = float(entry_price)
-    except Exception:
-        entry_price = 0.0
+    order_token_candidates = []
+    if strategy_order_tokens:
+        order_token_candidates = [
+            candidate
+            for candidate in candidates
+            if str(candidate[0].get('instrument_token', candidate[0].get('instrument_key', '')) or '').strip() in strategy_order_tokens
+        ]
+
+    selection_pool = candidates
+    selection_reason = 'largest_short_position'
+    if tagged_position_candidates:
+        selection_pool = tagged_position_candidates
+        selection_reason = 'position_tag_match'
+    elif order_token_candidates:
+        selection_pool = order_token_candidates
+        selection_reason = 'order_tag_token_match'
+
+    logger.info(
+        'Startup position sync candidate selection | total=%s | tag_matches=%s | order_token_matches=%s | reason=%s',
+        len(candidates),
+        len(tagged_position_candidates),
+        len(order_token_candidates),
+        selection_reason,
+    )
+
+    selected_row, option_type, qty = max(selection_pool, key=lambda item: item[2])
 
     option_instrument = str(selected_row.get('instrument_token', selected_row.get('instrument_key', '')))
+    entry_price = _resolve_entry_price_from_position(uplink_obj, selected_row, int(qty), option_instrument)
     lots = max(1, int(round(qty / max(1, int(Config.NIFTY_CONFIG.get('lot_size', 1))))))
 
     Config.POSITION_CONFIG[symbol] = {
