@@ -24,6 +24,7 @@ class UpstoxApi:
         self._force_v2_order_api = False
         configuration = upstox_client.Configuration()
         configuration.access_token = accessToken
+        configuration.host = Config.get_upstox_v2_base_url()
 
         self.order_instance = upstox_client.OrderApi(upstox_client.ApiClient(configuration))
         self.position_instance = upstox_client.PortfolioApi(upstox_client.ApiClient(configuration))
@@ -50,6 +51,10 @@ class UpstoxApi:
     def _get_v3_base_url(self):
         """Resolve V3 order API base URL for sandbox/live usage."""
         return Config.get_upstox_v3_order_base_url()
+
+    def _get_v2_base_url(self):
+        """Resolve V2 REST API base URL for sandbox/live usage."""
+        return Config.get_upstox_v2_base_url()
 
     def _get_v3_quote_base_url(self):
         """Resolve V3 quote API base URL."""
@@ -89,6 +94,58 @@ class UpstoxApi:
             raise RuntimeError(f'V3 API HTTP {err.code} {err.reason}: {error_body}') from err
         except URLError as err:
             raise RuntimeError(f'V3 API connection error: {err}') from err
+
+    def _v2_request(self, method, path, payload=None, query_params=None, base_url=None):
+        """Perform an authenticated HTTP call to the Upstox V2 API."""
+        resolved_base_url = base_url or self._get_v2_base_url()
+        url = f"{resolved_base_url}{path}"
+        if query_params:
+            url = f"{url}?{parse.urlencode(query_params)}"
+
+        body = None
+        if payload is not None:
+            body = json.dumps(payload).encode('utf-8')
+
+        req = request.Request(
+            url,
+            data=body,
+            method=method,
+            headers={
+                'Authorization': f'Bearer {self.accessToken}',
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'Api-Version': self.api_version,
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
+                'Connection': 'keep-alive',
+                'Cache-Control': 'no-cache',
+            },
+        )
+
+        try:
+            with request.urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode('utf-8')
+                return json.loads(raw) if raw else {}
+        except HTTPError as err:
+            error_body = err.read().decode('utf-8', errors='replace')
+            try:
+                parsed = json.loads(error_body) if error_body else {}
+            except Exception:
+                parsed = {}
+
+            if not isinstance(parsed, dict):
+                parsed = {}
+
+            parsed.setdefault('status', 'error')
+            parsed.setdefault('data', [])
+            parsed.setdefault('errors', [{
+                'errorCode': f'HTTP_{err.code}',
+                'message': error_body or err.reason,
+            }])
+            parsed['http_status'] = err.code
+            parsed['source'] = 'v2_rest'
+            return parsed
+        except URLError as err:
+            raise RuntimeError(f'V2 API connection error: {err}') from err
 
     
     def truncate(self, price):
@@ -183,10 +240,23 @@ class UpstoxApi:
     def getPositionBook(self):
         """Get position book"""
         try:
+            if Config.is_sandbox_mode():
+                position_book = self._v2_request('GET', '/v2/portfolio/short-term-positions')
+                if isinstance(position_book, dict) and str(position_book.get('status', '')).lower() == 'error':
+                    logger.warning('Sandbox positions endpoint returned error payload: %s', position_book)
+                return position_book
+
             position_book = self.position_instance.get_positions(self.api_version)
             return position_book.to_dict()
         except Exception as e:
-            logger.exception(f'Error fetching positions: {e}')
+            logger.warning('SDK positions fetch failed; retrying via direct v2 REST call. Error: %s', e)
+            try:
+                position_book = self._v2_request('GET', '/v2/portfolio/short-term-positions')
+                if isinstance(position_book, dict) and str(position_book.get('status', '')).lower() == 'error':
+                    logger.warning('V2 REST positions fallback returned error payload: %s', position_book)
+                return position_book
+            except Exception as fallback_exc:
+                logger.exception(f'Error fetching positions: {fallback_exc}')
         return None
 
     

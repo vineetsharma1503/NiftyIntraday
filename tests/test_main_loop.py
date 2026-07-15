@@ -104,6 +104,38 @@ class MainLoopTests(unittest.TestCase):
             self.assertEqual(Config.POSITION_CONFIG['NIFTY']['qty'], 75)
             self.assertEqual(Config.POSITION_CONFIG['NIFTY']['entry_price'], 120.5)
 
+    def test_initialize_runtime_state_preserves_existing_position_on_endpoint_error(self):
+        uplink = SimpleNamespace(
+            getPositionBook=lambda: {
+                'status': 'error',
+                'data': [],
+                'errors': [
+                    {
+                        'errorCode': 'UDAPI100060',
+                        'message': 'Resource not Found.',
+                    }
+                ],
+            }
+        )
+
+        existing_position = {
+            'option_instrument': 'NFO_OPT|NIFTY25JUL24500PE',
+            'index_instrument': 'NSE_INDEX|Nifty 50',
+            'qty': 75,
+            'entry_price': 120.5,
+            'option_type': 'PE',
+            'lots': 1,
+            'source': 'manual',
+        }
+
+        with patch('main.Config.PERSISTED_DAILY_ENTRY_COUNTS', {}, create=True), \
+             patch('main.Config.DAILY_ENTRY_COUNTS', {}, create=True), \
+             patch('main.Config._DAILY_ENTRY_COUNTS_LOADED', False, create=True), \
+             patch('main.Config.POSITION_CONFIG', {'NIFTY': dict(existing_position)}, create=True), \
+             patch('main.Config.NIFTY_CONFIG', {'index_instrument': 'NSE_INDEX|Nifty 50', 'lot_size': 75, 'enable': True}, create=True):
+            initialize_runtime_state(uplink)
+            self.assertEqual(Config.POSITION_CONFIG.get('NIFTY'), existing_position)
+
     def test_initialize_runtime_state_prefers_strategy_tagged_order_token(self):
         uplink = SimpleNamespace(
             getPositionBook=lambda: {

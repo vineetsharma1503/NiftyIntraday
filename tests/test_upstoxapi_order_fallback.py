@@ -26,6 +26,19 @@ class _DummyOrderInstance:
         return _DummyResponse(self.payload)
 
 
+class _DummyPositionInstance:
+    def __init__(self, payload=None, error=None):
+        self.payload = payload
+        self.error = error
+        self.calls = []
+
+    def get_positions(self, api_version):
+        self.calls.append(('get_positions', api_version))
+        if self.error is not None:
+            raise self.error
+        return _DummyResponse(self.payload)
+
+
 class UpstoxApiOrderFallbackTests(unittest.TestCase):
     def _make_api(self):
         api = UpstoxApi.__new__(UpstoxApi)
@@ -75,6 +88,36 @@ class UpstoxApiOrderFallbackTests(unittest.TestCase):
         self.assertIsInstance(payload, dict)
         self.assertEqual(payload.get('status'), 'success')
         self.assertEqual(payload.get('data', [{}])[0].get('order_id'), 'abc')
+
+    def test_init_points_sdk_clients_to_configured_v2_host(self):
+        with patch('upstoxapi.Config.get_upstox_v2_base_url', return_value='https://api-sandbox.upstox.com'):
+            api = UpstoxApi('test-token')
+
+        self.assertEqual(api.position_instance.api_client.configuration.host, 'https://api-sandbox.upstox.com')
+
+    def test_get_position_book_uses_direct_v2_request_in_sandbox(self):
+        api = self._make_api()
+        api.position_instance = _DummyPositionInstance(error=AssertionError('SDK path should not be used in sandbox'))
+        api._v2_request = lambda *_args, **_kwargs: {'status': 'success', 'data': [{'instrument_token': 'NFO_OPT|TEST'}]}
+
+        with patch('upstoxapi.Config.is_sandbox_mode', return_value=True):
+            payload = api.getPositionBook()
+
+        self.assertEqual(payload.get('status'), 'success')
+        self.assertEqual(payload.get('data', [{}])[0].get('instrument_token'), 'NFO_OPT|TEST')
+        self.assertEqual(api.position_instance.calls, [])
+
+    def test_get_position_book_falls_back_to_direct_v2_after_sdk_error(self):
+        api = self._make_api()
+        api.position_instance = _DummyPositionInstance(error=RuntimeError('invalid token on wrong host'))
+        api._v2_request = lambda *_args, **_kwargs: {'status': 'success', 'data': [{'instrument_token': 'NFO_OPT|FALLBACK'}]}
+
+        with patch('upstoxapi.Config.is_sandbox_mode', return_value=False):
+            payload = api.getPositionBook()
+
+        self.assertEqual(len(api.position_instance.calls), 1)
+        self.assertEqual(payload.get('status'), 'success')
+        self.assertEqual(payload.get('data', [{}])[0].get('instrument_token'), 'NFO_OPT|FALLBACK')
 
 
 if __name__ == '__main__':

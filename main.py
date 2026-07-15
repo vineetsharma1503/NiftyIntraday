@@ -407,6 +407,10 @@ def _sync_position_config_from_broker(uplink_obj):
         logger.warning('Position sync skipped: unexpected position book payload type')
         return
 
+    if str(position_book.get('status', '')).lower() == 'error':
+        logger.warning('Position sync skipped: broker positions endpoint returned error payload: %s', position_book.get('errors', []))
+        return
+
     positions = position_book.get('data', [])
     if not isinstance(positions, list):
         logger.warning('Position sync skipped: unexpected data in position book payload')
