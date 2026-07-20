@@ -22,14 +22,18 @@ class UpstoxApi:
         self.accessToken = accessToken
         self.api_version = api_version
         self._force_v2_order_api = False
-        configuration = upstox_client.Configuration()
-        configuration.access_token = accessToken
-        configuration.host = Config.get_upstox_v2_base_url()
+        order_configuration = upstox_client.Configuration()
+        order_configuration.access_token = accessToken
+        order_configuration.host = Config.get_upstox_v2_base_url()
 
-        self.order_instance = upstox_client.OrderApi(upstox_client.ApiClient(configuration))
-        self.position_instance = upstox_client.PortfolioApi(upstox_client.ApiClient(configuration))
-        self.quote_instance = upstox_client.MarketQuoteApi(upstox_client.ApiClient(configuration))
-        self.histdata_instance = upstox_client.HistoryApi(upstox_client.ApiClient(configuration))
+        market_configuration = upstox_client.Configuration()
+        market_configuration.access_token = accessToken
+        market_configuration.host = Config.get_upstox_live_v2_base_url()
+
+        self.order_instance = upstox_client.OrderApi(upstox_client.ApiClient(order_configuration))
+        self.position_instance = upstox_client.PortfolioApi(upstox_client.ApiClient(order_configuration))
+        self.quote_instance = upstox_client.MarketQuoteApi(upstox_client.ApiClient(market_configuration))
+        self.histdata_instance = upstox_client.HistoryApi(upstox_client.ApiClient(market_configuration))
 
     def _use_v3_order_api(self):
         """Return True when order APIs should be called via Upstox V3 endpoints."""
@@ -243,7 +247,7 @@ class UpstoxApi:
             if Config.is_sandbox_mode():
                 position_book = self._v2_request('GET', '/v2/portfolio/short-term-positions')
                 if isinstance(position_book, dict) and str(position_book.get('status', '')).lower() == 'error':
-                    logger.warning('Sandbox positions endpoint returned error payload: %s', position_book)
+                    logger.info('Sandbox positions endpoint unavailable; returning error payload: %s', position_book)
                 return position_book
 
             position_book = self.position_instance.get_positions(self.api_version)
@@ -257,6 +261,71 @@ class UpstoxApi:
                 return position_book
             except Exception as fallback_exc:
                 logger.exception(f'Error fetching positions: {fallback_exc}')
+        return None
+
+    def getMarginDetails(self, instruments):
+        """Get margin requirements using Upstox margin API for a basket of instruments."""
+        try:
+            payload = {'instruments': list(instruments or [])[:20]}
+            if not payload['instruments']:
+                logger.warning('Margin API skipped: empty instruments payload')
+                return None
+            return self._v2_request('POST', '/v2/charges/margin', payload=payload)
+        except Exception as e:
+            logger.warning('Error fetching margin details: %s', e)
+        return None
+
+    def getRequiredMargin(self, instrument_key, quantity, transaction_type='SELL', product=None, price=None):
+        """Get required margin for one instrument using Upstox POST /v2/charges/margin."""
+        try:
+            qty = int(abs(float(quantity)))
+        except Exception:
+            qty = 0
+
+        if qty <= 0:
+            return None
+
+        instrument_payload = {
+            'instrument_key': instrument_key,
+            'quantity': qty,
+            'transaction_type': str(transaction_type or 'SELL').upper(),
+            'product': product or Config.ORDER_TYPE,
+        }
+        if price is not None:
+            try:
+                parsed_price = float(price)
+                if parsed_price > 0:
+                    instrument_payload['price'] = self.truncate(parsed_price)
+            except Exception:
+                pass
+
+        margin_response = self.getMarginDetails([instrument_payload])
+        if not isinstance(margin_response, dict):
+            return None
+
+        data = margin_response.get('data', {}) if isinstance(margin_response.get('data', {}), dict) else {}
+        required_margin = data.get('required_margin')
+        if required_margin is not None:
+            try:
+                return float(required_margin)
+            except Exception:
+                pass
+
+        final_margin = data.get('final_margin')
+        if final_margin is not None:
+            try:
+                return float(final_margin)
+            except Exception:
+                pass
+
+        margins = data.get('margins', []) if isinstance(data.get('margins', []), list) else []
+        if margins and isinstance(margins[0], dict):
+            total_margin = margins[0].get('total_margin')
+            if total_margin is not None:
+                try:
+                    return float(total_margin)
+                except Exception:
+                    pass
         return None
 
     
@@ -347,56 +416,103 @@ class UpstoxApi:
     # MARKET DATA & QUOTES
     # ============================================================================
 
+    @staticmethod
+    def _extract_numeric_quote_value(entry):
+        """Extract numeric quote from common quote payload shapes."""
+        if not isinstance(entry, dict):
+            try:
+                return float(entry)
+            except Exception:
+                return None
+
+        for key in ('last_price', 'ltp', 'last_traded_price', 'close', 'price', 'value'):
+            try:
+                value = entry.get(key)
+                if value is not None:
+                    return float(value)
+            except Exception:
+                continue
+
+        ohlc = entry.get('ohlc')
+        if isinstance(ohlc, dict):
+            for key in ('close', 'last_price'):
+                try:
+                    value = ohlc.get(key)
+                    if value is not None:
+                        return float(value)
+                except Exception:
+                    continue
+        return None
+
     
     def getLTP(self, instrument_key):
         """Get Last Traded Price"""
         try:
             if self._use_v3_quote_api():
-                quote_data = self._v3_request(
-                    'GET',
-                    '/v3/market-quote/ohlc',
-                    query_params={
-                        'instrument_key': instrument_key,
-                        'interval': 'I1',
-                    },
-                    base_url=self._get_v3_quote_base_url(),
-                )
-                logger.debug(f"V3 quote_data for {instrument_key}: {quote_data}")
+                try:
+                    quote_data = self._v3_request(
+                        'GET',
+                        '/v3/market-quote/ohlc',
+                        query_params={
+                            'instrument_key': instrument_key,
+                            'interval': 'I1',
+                        },
+                        base_url=self._get_v3_quote_base_url(),
+                    )
+                    logger.debug(f"V3 quote_data for {instrument_key}: {quote_data}")
 
-                data = quote_data.get('data', {}) if isinstance(quote_data, dict) else {}
-                if not isinstance(data, dict) or not data:
-                    logger.error('No quote data returned for %s from V3 quote API', instrument_key)
-                    return None
+                    data = quote_data.get('data', {}) if isinstance(quote_data, dict) else {}
+                    if isinstance(data, dict) and data:
+                        if instrument_key in data and isinstance(data[instrument_key], dict):
+                            extracted = self._extract_numeric_quote_value(data[instrument_key])
+                            if extracted is not None:
+                                return extracted
 
-                if instrument_key in data and isinstance(data[instrument_key], dict) and 'last_price' in data[instrument_key]:
-                    return float(data[instrument_key]['last_price'])
+                        colon_key = instrument_key.replace('|', ':')
+                        if colon_key in data and isinstance(data[colon_key], dict):
+                            extracted = self._extract_numeric_quote_value(data[colon_key])
+                            if extracted is not None:
+                                return extracted
 
-                colon_key = instrument_key.replace('|', ':')
-                if colon_key in data and isinstance(data[colon_key], dict) and 'last_price' in data[colon_key]:
-                    return float(data[colon_key]['last_price'])
+                        for entry in data.values():
+                            if not isinstance(entry, dict):
+                                continue
+                            if str(entry.get('instrument_token')) == instrument_key:
+                                extracted = self._extract_numeric_quote_value(entry)
+                                if extracted is not None:
+                                    return extracted
 
-                for entry in data.values():
-                    if not isinstance(entry, dict):
-                        continue
-                    if str(entry.get('instrument_token')) == instrument_key and 'last_price' in entry:
-                        return float(entry['last_price'])
+                        for entry in data.values():
+                            if isinstance(entry, dict):
+                                extracted = self._extract_numeric_quote_value(entry)
+                                if extracted is not None:
+                                    return extracted
 
-                for entry in data.values():
-                    if isinstance(entry, dict) and 'last_price' in entry:
-                        return float(entry['last_price'])
-
-                logger.error('Instrument key %s not found in V3 quote response data keys=%s', instrument_key, list(data.keys()))
-                return None
+                    logger.warning(
+                        'V3 quote API did not yield LTP for %s; falling back to V2 quote API',
+                        instrument_key,
+                    )
+                except Exception as v3_exc:
+                    logger.warning('V3 quote fetch failed for %s; falling back to V2 quote API: %s', instrument_key, v3_exc)
 
             quote_response = self.quote_instance.get_full_market_quote(instrument_key, self.api_version)
             quote_data = quote_response.to_dict()
             logger.debug(f"Full quote_data for {instrument_key}: {quote_data}")
             if 'data' in quote_data and instrument_key in quote_data['data']:
-                return float(quote_data['data'][instrument_key]['last_price'])
+                extracted = self._extract_numeric_quote_value(quote_data['data'][instrument_key])
+                if extracted is not None:
+                    return extracted
             elif 'data' in quote_data:
                 for entry in quote_data['data'].values():
                     if str(entry.get('instrument_token')) == instrument_key:
-                        return float(entry['last_price'])
+                        extracted = self._extract_numeric_quote_value(entry)
+                        if extracted is not None:
+                            return extracted
+                # Some quote payloads do not include instrument_token; use best-effort numeric extraction.
+                for entry in quote_data['data'].values():
+                    extracted = self._extract_numeric_quote_value(entry)
+                    if extracted is not None:
+                        return extracted
                 logger.error(f"Instrument token {instrument_key} not found in quote_data['data'].")
             else:
                 logger.error(f"Instrument key {instrument_key} not found in quote_data['data'].")

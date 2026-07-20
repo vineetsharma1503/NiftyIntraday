@@ -12,6 +12,7 @@ from main import (
     _persist_daily_entry_counts_to_config,
     _run_signal_check_with_timeout,
     check_entry_signals,
+    evaluate_trailing_stop_loss,
     get_next_check_time,
     initialize_runtime_state,
     is_trading_time,
@@ -244,6 +245,116 @@ class MainLoopTests(unittest.TestCase):
             self.assertIn('NIFTY', Config.POSITION_CONFIG)
             self.assertAlmostEqual(Config.POSITION_CONFIG['NIFTY']['entry_price'], 122.0)
 
+    def test_initialize_runtime_state_restores_trailing_mode_on_restart(self):
+        class TrailingUplink:
+            def getPositionBook(self):
+                return {
+                    'data': [
+                        {
+                            'instrument_token': 'NFO_OPT|NIFTY25JUL24500PE',
+                            'trading_symbol': 'NIFTY25JUL24500PE',
+                            'quantity': -75,
+                            'average_price': 500.0,
+                            'product': 'I',
+                        }
+                    ]
+                }
+
+            def getRequiredMargin(self, **_kwargs):
+                return 1_000_000
+
+            def getLTP(self, _instrument):
+                return 366.0
+
+        with patch('main.Config.PERSISTED_DAILY_ENTRY_COUNTS', {}, create=True), \
+             patch('main.Config.DAILY_ENTRY_COUNTS', {}, create=True), \
+             patch('main.Config._DAILY_ENTRY_COUNTS_LOADED', False, create=True), \
+             patch('main.Config.POSITION_CONFIG', {}, create=True), \
+             patch('main.Config.NIFTY_CONFIG', {'index_instrument': 'NSE_INDEX|Nifty 50', 'lot_size': 75, 'enable': True}, create=True), \
+             patch('main.Config.STRATEGY_CONFIG', {
+                 'ENABLE_TRAILING_STOP_LOSS': True,
+                 'TRAILING_ACTIVATION_PROFIT_PERCENT_OF_MARGIN': 1.0,
+                 'TRAILING_STOP_LOSS_GAP_PERCENT_OF_MARGIN': 0.5,
+                 'TRAILING_STEP_ABSOLUTE_RS': 1000,
+             }, create=True):
+            initialize_runtime_state(TrailingUplink())
+            self.assertIn('NIFTY', Config.POSITION_CONFIG)
+            self.assertTrue(Config.POSITION_CONFIG['NIFTY']['trailing_stop_loss']['active'])
+            self.assertAlmostEqual(Config.POSITION_CONFIG['NIFTY']['trailing_stop_loss']['stop_loss_pnl'], 5050.0)
+
+    def test_initialize_runtime_state_prefers_seeded_config_position_when_present_in_broker_candidates(self):
+        seeded_position = {
+            'option_instrument': 'NFO_OPT|NIFTY25JUL24500PE',
+            'index_instrument': 'NSE_INDEX|Nifty 50',
+            'qty': 75,
+            'entry_price': 121.0,
+            'option_type': 'PE',
+            'lots': 1,
+            'entry_order_id': 'seed-order',
+            'order_status': 'submitted',
+        }
+
+        uplink = SimpleNamespace(
+            getPositionBook=lambda: {
+                'data': [
+                    {
+                        'instrument_token': 'NFO_OPT|NIFTY25JUL24450CE',
+                        'trading_symbol': 'NIFTY25JUL24450CE',
+                        'quantity': -150,
+                        'average_price': 180.0,
+                        'product': 'I',
+                    },
+                    {
+                        'instrument_token': 'NFO_OPT|NIFTY25JUL24500PE',
+                        'trading_symbol': 'NIFTY25JUL24500PE',
+                        'quantity': -75,
+                        'average_price': 120.5,
+                        'product': 'I',
+                    },
+                ]
+            },
+            getOrderBook=lambda: {'data': []},
+        )
+
+        with patch('main.Config.PERSISTED_DAILY_ENTRY_COUNTS', {}, create=True), \
+             patch('main.Config.DAILY_ENTRY_COUNTS', {}, create=True), \
+             patch('main.Config._DAILY_ENTRY_COUNTS_LOADED', False, create=True), \
+             patch('main.Config.POSITION_CONFIG', {'NIFTY': dict(seeded_position)}, create=True), \
+             patch('main.Config.ORDER_TAG', 'STRATEGY_NIFTY_INTRADAY', create=True), \
+             patch('main.Config.ORDER_TYPE', 'I', create=True), \
+             patch('main.Config.NIFTY_CONFIG', {'index_instrument': 'NSE_INDEX|Nifty 50', 'lot_size': 75, 'enable': True}, create=True):
+            initialize_runtime_state(uplink)
+            self.assertEqual(Config.POSITION_CONFIG['NIFTY']['option_instrument'], seeded_position['option_instrument'])
+            self.assertEqual(Config.POSITION_CONFIG['NIFTY']['qty'], 75)
+            self.assertEqual(Config.POSITION_CONFIG['NIFTY']['entry_order_id'], 'seed-order')
+
+    def test_initialize_runtime_state_retains_seeded_config_position_when_broker_has_no_candidates(self):
+        seeded_position = {
+            'option_instrument': 'NFO_OPT|NIFTY25JUL24500PE',
+            'index_instrument': 'NSE_INDEX|Nifty 50',
+            'qty': 75,
+            'entry_price': 121.0,
+            'option_type': 'PE',
+            'lots': 1,
+            'entry_order_id': 'seed-order',
+            'order_status': 'submitted',
+        }
+
+        uplink = SimpleNamespace(
+            getPositionBook=lambda: {'data': []},
+            getOrderBook=lambda: {'data': []},
+        )
+
+        with patch('main.Config.PERSISTED_DAILY_ENTRY_COUNTS', {}, create=True), \
+             patch('main.Config.DAILY_ENTRY_COUNTS', {}, create=True), \
+             patch('main.Config._DAILY_ENTRY_COUNTS_LOADED', False, create=True), \
+             patch('main.Config.POSITION_CONFIG', {'NIFTY': dict(seeded_position)}, create=True), \
+             patch('main.Config.ORDER_TAG', 'STRATEGY_NIFTY_INTRADAY', create=True), \
+             patch('main.Config.ORDER_TYPE', 'I', create=True), \
+             patch('main.Config.NIFTY_CONFIG', {'index_instrument': 'NSE_INDEX|Nifty 50', 'lot_size': 75, 'enable': True}, create=True):
+            initialize_runtime_state(uplink)
+            self.assertEqual(Config.POSITION_CONFIG.get('NIFTY'), seeded_position)
+
     def test_persist_daily_entry_counts_updates_config_file(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             config_path = os.path.join(tmp_dir, 'Config.py')
@@ -319,6 +430,319 @@ class MainLoopTests(unittest.TestCase):
 
         self.assertFalse(any(results[:11]))
         self.assertTrue(results[11])
+
+    def test_trailing_stop_loss_activates_at_threshold_and_sets_initial_stop(self):
+        class TrailingUplink:
+            def getRequiredMargin(self, **_kwargs):
+                return 1_000_000
+
+            def getLTP(self, _instrument):
+                return 366.0
+
+        position_config = {
+            'option_instrument': 'NFO_OPT|NIFTY_TEST_PE',
+            'qty': 75,
+            'entry_price': 500.0,
+            'option_type': 'PE',
+        }
+
+        with patch('main.Config.STRATEGY_CONFIG', {
+                'ENABLE_TRAILING_STOP_LOSS': True,
+                'TRAILING_ACTIVATION_PROFIT_PERCENT_OF_MARGIN': 1.0,
+                'TRAILING_STOP_LOSS_GAP_PERCENT_OF_MARGIN': 0.5,
+                'TRAILING_STEP_ABSOLUTE_RS': 1000,
+            }, create=True):
+            result = evaluate_trailing_stop_loss(TrailingUplink(), 'NIFTY', position_config)
+
+        self.assertTrue(result['active'])
+        self.assertEqual(result['action'], 'hold')
+        self.assertAlmostEqual(position_config['trailing_stop_loss']['stop_loss_pnl'], 5050.0)
+
+    def test_trailing_stop_loss_moves_only_by_configured_step(self):
+        class TrailingUplink:
+            def __init__(self):
+                self._ltps = [366.6666667, 353.3333333]
+                self._idx = 0
+
+            def getRequiredMargin(self, **_kwargs):
+                return 1_000_000
+
+            def getLTP(self, _instrument):
+                ltp = self._ltps[min(self._idx, len(self._ltps) - 1)]
+                self._idx += 1
+                return ltp
+
+        uplink = TrailingUplink()
+        position_config = {
+            'option_instrument': 'NFO_OPT|NIFTY_TEST_PE',
+            'qty': 75,
+            'entry_price': 500.0,
+            'option_type': 'PE',
+        }
+
+        with patch('main.Config.STRATEGY_CONFIG', {
+                'ENABLE_TRAILING_STOP_LOSS': True,
+                'TRAILING_ACTIVATION_PROFIT_PERCENT_OF_MARGIN': 1.0,
+                'TRAILING_STOP_LOSS_GAP_PERCENT_OF_MARGIN': 0.5,
+                'TRAILING_STEP_ABSOLUTE_RS': 1000,
+            }, create=True):
+            evaluate_trailing_stop_loss(uplink, 'NIFTY', position_config)
+            evaluate_trailing_stop_loss(uplink, 'NIFTY', position_config)
+
+        self.assertAlmostEqual(position_config['trailing_stop_loss']['stop_loss_pnl'], 6000.0, places=4)
+
+    def test_trailing_stop_loss_does_not_move_when_profit_drops(self):
+        class TrailingUplink:
+            def __init__(self):
+                self._ltps = [340.0, 346.6666667]
+                self._idx = 0
+
+            def getRequiredMargin(self, **_kwargs):
+                return 1_000_000
+
+            def getLTP(self, _instrument):
+                ltp = self._ltps[min(self._idx, len(self._ltps) - 1)]
+                self._idx += 1
+                return ltp
+
+        uplink = TrailingUplink()
+        position_config = {
+            'option_instrument': 'NFO_OPT|NIFTY_TEST_PE',
+            'qty': 75,
+            'entry_price': 500.0,
+            'option_type': 'PE',
+        }
+
+        with patch('main.Config.STRATEGY_CONFIG', {
+                'ENABLE_TRAILING_STOP_LOSS': True,
+                'TRAILING_ACTIVATION_PROFIT_PERCENT_OF_MARGIN': 1.0,
+                'TRAILING_STOP_LOSS_GAP_PERCENT_OF_MARGIN': 0.5,
+                'TRAILING_STEP_ABSOLUTE_RS': 1000,
+            }, create=True):
+            evaluate_trailing_stop_loss(uplink, 'NIFTY', position_config)
+            evaluate_trailing_stop_loss(uplink, 'NIFTY', position_config)
+
+        self.assertAlmostEqual(position_config['trailing_stop_loss']['stop_loss_pnl'], 7000.0)
+
+    def test_trailing_stop_loss_accepts_dict_like_ltp_payload(self):
+        class TrailingUplink:
+            def getRequiredMargin(self, **_kwargs):
+                return 1_000_000
+
+            def getLTP(self, _instrument):
+                return {
+                    'data': {
+                        'NFO_OPT|NIFTY_TEST_PE': {
+                            'last_price': 366.0,
+                        }
+                    }
+                }
+
+        position_config = {
+            'option_instrument': 'NFO_OPT|NIFTY_TEST_PE',
+            'qty': 75,
+            'entry_price': 500.0,
+            'option_type': 'PE',
+        }
+
+        with patch('main.Config.STRATEGY_CONFIG', {
+                'ENABLE_TRAILING_STOP_LOSS': True,
+                'TRAILING_ACTIVATION_PROFIT_PERCENT_OF_MARGIN': 1.0,
+                'TRAILING_STOP_LOSS_GAP_PERCENT_OF_MARGIN': 0.5,
+                'TRAILING_STEP_ABSOLUTE_RS': 1000,
+            }, create=True):
+            result = evaluate_trailing_stop_loss(TrailingUplink(), 'NIFTY', position_config)
+
+        self.assertEqual(result['action'], 'hold')
+        self.assertTrue(result['active'])
+        self.assertAlmostEqual(result['running_pnl'], 10050.0)
+
+    def test_trailing_stop_loss_uses_position_row_ltp_fallback_when_get_ltp_unavailable(self):
+        class TrailingUplink:
+            def getRequiredMargin(self, **_kwargs):
+                return 10_000
+
+            def getPositionBook(self):
+                return {
+                    'data': [
+                        {
+                            'instrument_token': 'NFO_OPT|NIFTY_TEST_PE',
+                            'quantity': -10,
+                            'last_price': 90.0,
+                            'pnl': None,
+                        }
+                    ]
+                }
+
+        position_config = {
+            'option_instrument': 'NFO_OPT|NIFTY_TEST_PE',
+            'qty': 10,
+            'entry_price': 100.0,
+            'option_type': 'PE',
+        }
+
+        with patch('main.Config.STRATEGY_CONFIG', {
+                'ENABLE_TRAILING_STOP_LOSS': True,
+                'TRAILING_ACTIVATION_PROFIT_PERCENT_OF_MARGIN': 1.0,
+                'TRAILING_STOP_LOSS_GAP_PERCENT_OF_MARGIN': 0.5,
+                'TRAILING_STEP_ABSOLUTE_RS': 1000,
+            }, create=True):
+            result = evaluate_trailing_stop_loss(TrailingUplink(), 'NIFTY', position_config)
+
+        self.assertEqual(result['action'], 'hold')
+        self.assertTrue(result['active'])
+        self.assertAlmostEqual(result['running_pnl'], 100.0)
+
+    def test_trailing_stop_loss_exits_when_running_pnl_below_trail(self):
+        class TrailingUplink:
+            def getRequiredMargin(self, **_kwargs):
+                return 1_000_000
+
+            def getLTP(self, _instrument):
+                return 394.6666667
+
+        position_config = {
+            'option_instrument': 'NFO_OPT|NIFTY_TEST_PE',
+            'qty': 75,
+            'entry_price': 500.0,
+            'option_type': 'PE',
+            'trailing_stop_loss': {
+                'active': True,
+                'stop_loss_pnl': 8000.0,
+                'last_peak_pnl': 13000.0,
+                'last_trail_anchor_pnl': 12000.0,
+            },
+        }
+
+        with patch('main.Config.STRATEGY_CONFIG', {
+                'ENABLE_TRAILING_STOP_LOSS': True,
+                'TRAILING_ACTIVATION_PROFIT_PERCENT_OF_MARGIN': 1.0,
+                'TRAILING_STOP_LOSS_GAP_PERCENT_OF_MARGIN': 0.5,
+                'TRAILING_STEP_ABSOLUTE_RS': 1000,
+            }, create=True):
+            result = evaluate_trailing_stop_loss(TrailingUplink(), 'NIFTY', position_config)
+
+        self.assertEqual(result['action'], 'exit')
+        self.assertTrue(result['active'])
+
+    def test_check_entry_signals_skips_strategy_logic_once_trailing_active(self):
+        class TrailingUplink:
+            def customCandleData(self, *_args, **_kwargs):
+                return pd.DataFrame([
+                    {'date': pd.Timestamp('2026-07-10 09:15:00', tz='Asia/Kolkata'), 'open': 100.0, 'high': 110.0, 'low': 95.0, 'close': 108.0, 'volume': 1000, 'oi': 0},
+                    {'date': pd.Timestamp('2026-07-10 09:20:00', tz='Asia/Kolkata'), 'open': 108.0, 'high': 112.0, 'low': 102.0, 'close': 111.0, 'volume': 1000, 'oi': 0},
+                ])
+
+            def getRequiredMargin(self, **_kwargs):
+                return 1_000_000
+
+            def getLTP(self, _instrument):
+                return 360.0
+
+        uplink = TrailingUplink()
+        with patch('main.Config.NIFTY_CONFIG', {'enable': True, 'index_instrument': 'NSE_INDEX|Nifty 50', 'lot_size': 75}), \
+             patch('main.Config.STRATEGY_CONFIG', {
+                 'LOTS': 1,
+                 'MAX_ENTRIES': 3,
+                 'TIMEFRAME': 5,
+                 'ENABLE_TRAILING_STOP_LOSS': True,
+                 'TRAILING_ACTIVATION_PROFIT_PERCENT_OF_MARGIN': 1.0,
+                 'TRAILING_STOP_LOSS_GAP_PERCENT_OF_MARGIN': 0.5,
+                 'TRAILING_STEP_ABSOLUTE_RS': 1000,
+             }, create=True), \
+             patch('main.Config.POSITION_CONFIG', {
+                 'NIFTY': {
+                     'option_instrument': 'NFO_OPT|NIFTY_TEST_PE',
+                     'qty': 75,
+                     'entry_price': 500.0,
+                     'option_type': 'PE',
+                 }
+             }, create=True), \
+             patch('main._get_fixed_daily_pivot_levels', return_value={'pivot': 100.0, 'r1': 105.0, 's1': 95.0}), \
+             patch('main.evaluate_strategy_signal') as mock_strategy_signal, \
+             patch('main.exit_position') as mock_exit:
+            check_entry_signals(uplink)
+
+        mock_strategy_signal.assert_not_called()
+        mock_exit.assert_not_called()
+
+    def test_get_next_check_time_uses_trailing_interval_when_active(self):
+        now = Config.TIME_ZONE.localize(datetime(2026, 7, 7, 9, 22, 10))
+
+        with patch('main.is_trailing_stop_loss_enabled', return_value=True), \
+             patch('main._is_any_trailing_mode_active', return_value=True), \
+             patch('main.get_trailing_evaluation_interval_seconds', return_value=90.0):
+            next_time = get_next_check_time(now)
+
+        self.assertEqual(next_time, now + timedelta(seconds=90))
+
+    def test_get_next_check_time_stays_timeframe_aligned_when_position_open_but_trailing_inactive(self):
+        now = Config.TIME_ZONE.localize(datetime(2026, 7, 7, 9, 22, 10))
+
+        with patch('main.is_trailing_stop_loss_enabled', return_value=True), \
+             patch('main._is_any_trailing_mode_active', return_value=False), \
+             patch('main._has_any_tracked_open_position', return_value=True), \
+             patch('main.get_trailing_evaluation_interval_seconds', return_value=90.0):
+            next_time = get_next_check_time(now)
+
+        self.assertEqual(next_time, Config.TIME_ZONE.localize(datetime(2026, 7, 7, 9, 25, 1)))
+
+    def test_get_next_check_time_ignores_string_false_trailing_active_state(self):
+        now = Config.TIME_ZONE.localize(datetime(2026, 7, 7, 9, 22, 10))
+
+        with patch('main.is_trailing_stop_loss_enabled', return_value=True), \
+             patch('main.Config.POSITION_CONFIG', {
+                 'NIFTY': {
+                     'trailing_stop_loss': {
+                         'active': 'False',
+                     }
+                 }
+             }, create=True):
+            next_time = get_next_check_time(now)
+
+        self.assertEqual(next_time, Config.TIME_ZONE.localize(datetime(2026, 7, 7, 9, 25, 1)))
+
+    def test_check_entry_signals_continues_strategy_logic_when_trailing_enabled_but_not_armed(self):
+        class TrailingUplink:
+            def customCandleData(self, *_args, **_kwargs):
+                return pd.DataFrame([
+                    {'date': pd.Timestamp('2026-07-10 09:15:00', tz='Asia/Kolkata'), 'open': 100.0, 'high': 110.0, 'low': 95.0, 'close': 108.0, 'volume': 1000, 'oi': 0},
+                    {'date': pd.Timestamp('2026-07-10 09:20:00', tz='Asia/Kolkata'), 'open': 108.0, 'high': 112.0, 'low': 102.0, 'close': 111.0, 'volume': 1000, 'oi': 0},
+                ])
+
+            def getRequiredMargin(self, **_kwargs):
+                return 1_000_000
+
+            def getLTP(self, _instrument):
+                return 470.0
+
+        uplink = TrailingUplink()
+        with patch('main.Config.NIFTY_CONFIG', {'enable': True, 'index_instrument': 'NSE_INDEX|Nifty 50', 'lot_size': 75}), \
+             patch('main.Config.STRATEGY_CONFIG', {
+                 'LOTS': 1,
+                 'MAX_ENTRIES': 3,
+                 'TIMEFRAME': 5,
+                 'ENABLE_TRAILING_STOP_LOSS': True,
+                 'TRAILING_ACTIVATION_PROFIT_PERCENT_OF_MARGIN': 1.0,
+                 'TRAILING_STOP_LOSS_GAP_PERCENT_OF_MARGIN': 0.5,
+                 'TRAILING_STEP_ABSOLUTE_RS': 1000,
+             }, create=True), \
+             patch('main.Config.POSITION_CONFIG', {
+                 'NIFTY': {
+                     'option_instrument': 'NFO_OPT|NIFTY_TEST_PE',
+                     'qty': 75,
+                     'entry_price': 500.0,
+                     'option_type': 'PE',
+                     'trailing_stop_loss': {},
+                 }
+             }, create=True), \
+             patch('main._get_fixed_daily_pivot_levels', return_value={'pivot': 100.0, 'r1': 105.0, 's1': 95.0}), \
+             patch('main.evaluate_strategy_signal', return_value={'action': 'hold'}) as mock_strategy_signal, \
+             patch('main.exit_position') as mock_exit:
+            check_entry_signals(uplink)
+
+        mock_strategy_signal.assert_called_once()
+        mock_exit.assert_not_called()
 
 
 if __name__ == '__main__':

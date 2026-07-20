@@ -8,6 +8,7 @@ import warnings
 import json
 import os
 import re
+import math
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 warnings.filterwarnings('ignore')
 import pandas as pd
@@ -115,6 +116,376 @@ def is_test_mode_enabled():
     if isinstance(value, str):
         return value.strip().lower() in {'1', 'true', 'yes', 'on'}
     return bool(value)
+
+
+def _normalize_bool(value):
+    """Normalize strategy config values to bool."""
+    if isinstance(value, str):
+        return value.strip().lower() in {'1', 'true', 'yes', 'on'}
+    return bool(value)
+
+
+def _to_float_or_none(value):
+    """Safely parse numeric values and return None when parsing fails."""
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _extract_quote_numeric(value):
+    """Extract a numeric quote value from a scalar, dict, or nested payload."""
+    scalar_value = _to_float_or_none(value)
+    if scalar_value is not None:
+        return scalar_value
+
+    if isinstance(value, dict):
+        for key in ('last_price', 'ltp', 'last_traded_price', 'close', 'price', 'value'):
+            scalar_value = _to_float_or_none(value.get(key))
+            if scalar_value is not None:
+                return scalar_value
+
+        for nested_value in value.values():
+            scalar_value = _extract_quote_numeric(nested_value)
+            if scalar_value is not None:
+                return scalar_value
+
+    if isinstance(value, (list, tuple)):
+        for nested_value in value:
+            scalar_value = _extract_quote_numeric(nested_value)
+            if scalar_value is not None:
+                return scalar_value
+
+    return None
+
+
+def is_trailing_stop_loss_enabled():
+    """Return True when trailing stop-loss management is globally enabled."""
+    return _normalize_bool(Config.STRATEGY_CONFIG.get('ENABLE_TRAILING_STOP_LOSS', False))
+
+
+def get_trailing_activation_profit_percent_of_margin():
+    """Return the profit threshold % of used margin that activates trailing mode."""
+    value = _to_float_or_none(Config.STRATEGY_CONFIG.get('TRAILING_ACTIVATION_PROFIT_PERCENT_OF_MARGIN', 1.0))
+    return max(0.0, value if value is not None else 1.0)
+
+
+def get_trailing_gap_percent_of_margin():
+    """Return trailing gap as % of used margin."""
+    value = _to_float_or_none(Config.STRATEGY_CONFIG.get('TRAILING_STOP_LOSS_GAP_PERCENT_OF_MARGIN', 0.5))
+    return max(0.0, value if value is not None else 0.5)
+
+
+def get_trailing_step_absolute_rs():
+    """Return minimum profit increase needed before trailing SL is moved."""
+    value = _to_float_or_none(Config.STRATEGY_CONFIG.get('TRAILING_STEP_ABSOLUTE_RS', 1000.0))
+    return max(1.0, value if value is not None else 1000.0)
+
+
+def get_trailing_evaluation_interval_seconds():
+    """Return evaluation interval in seconds while trailing mode is active."""
+    value = _to_float_or_none(Config.STRATEGY_CONFIG.get('TRAILING_EVALUATION_INTERVAL_SECONDS', 60))
+    return max(1.0, value if value is not None else 60.0)
+
+
+def _is_any_trailing_mode_active():
+    """Return True when any tracked symbol currently has trailing mode active."""
+    tracked_positions = getattr(Config, 'POSITION_CONFIG', {})
+    if not isinstance(tracked_positions, dict):
+        return False
+
+    for position in tracked_positions.values():
+        if not isinstance(position, dict):
+            continue
+        trailing_state = position.get('trailing_stop_loss')
+        if isinstance(trailing_state, dict) and _normalize_bool(trailing_state.get('active', False)):
+            return True
+    return False
+
+
+def _has_any_tracked_open_position():
+    """Return True when the runtime has at least one tracked open position."""
+    tracked_positions = getattr(Config, 'POSITION_CONFIG', {})
+    return isinstance(tracked_positions, dict) and bool(tracked_positions)
+
+
+def _extract_row_numeric(row, keys, positive_only=False):
+    """Pick the first usable numeric value from candidate payload keys."""
+    if not isinstance(row, dict):
+        return None
+
+    for key in keys:
+        value = _to_float_or_none(row.get(key))
+        if value is None:
+            continue
+        if positive_only and value <= 0:
+            continue
+        return value
+    return None
+
+
+def _get_position_row_for_instrument(uplink_obj, option_instrument):
+    """Return broker position row matching the open option instrument."""
+    if not hasattr(uplink_obj, 'getPositionBook'):
+        return None
+
+    try:
+        position_book = uplink_obj.getPositionBook()
+    except Exception as exc:
+        logger.warning('Trailing stop-loss position book fetch failed: %s', exc)
+        return None
+
+    if not isinstance(position_book, dict):
+        return None
+
+    positions = position_book.get('data', [])
+    if not isinstance(positions, list):
+        return None
+
+    instrument_key = str(option_instrument or '').strip()
+    for row in positions:
+        if not isinstance(row, dict):
+            continue
+        token = str(row.get('instrument_token', row.get('instrument_key', '')) or '').strip()
+        if token and token == instrument_key:
+            return row
+    return None
+
+
+def _compute_short_pnl_from_ltp(uplink_obj, position_config):
+    """Compute running PnL for short option positions using LTP fallback."""
+    option_instrument = str(position_config.get('option_instrument', '') or '').strip()
+    if not option_instrument or not hasattr(uplink_obj, 'getLTP'):
+        return None, None
+
+    entry_price = _to_float_or_none(position_config.get('entry_price'))
+    qty = int(position_config.get('qty', 0) or 0)
+    if entry_price is None or qty <= 0:
+        return None, None
+
+    try:
+        ltp = _extract_quote_numeric(uplink_obj.getLTP(option_instrument))
+    except Exception as exc:
+        logger.warning('Trailing stop-loss LTP fetch failed for %s: %s', option_instrument, exc)
+        return None, None
+
+    if ltp is None:
+        return None, None
+
+    # Strategy takes short option entries, so PnL improves as option premium falls.
+    pnl = (entry_price - ltp) * qty
+    return pnl, ltp
+
+
+def _resolve_margin_via_margin_api(uplink_obj, position_config):
+    """Resolve required margin for the open position via Upstox POST /v2/charges/margin."""
+    if not hasattr(uplink_obj, 'getRequiredMargin'):
+        return None
+
+    option_instrument = str(position_config.get('option_instrument', '') or '').strip()
+    qty = int(position_config.get('qty', 0) or 0)
+    if not option_instrument or qty <= 0:
+        return None
+
+    transaction_type = str(position_config.get('transaction_type', 'SELL') or 'SELL').upper()
+    product = str(position_config.get('product', getattr(Config, 'ORDER_TYPE', 'I')) or getattr(Config, 'ORDER_TYPE', 'I')).upper()
+
+    try:
+        margin = uplink_obj.getRequiredMargin(
+            instrument_key=option_instrument,
+            quantity=qty,
+            transaction_type=transaction_type,
+            product=product,
+        )
+    except Exception as exc:
+        logger.warning('Trailing stop-loss margin API call failed for %s: %s', option_instrument, exc)
+        return None
+
+    margin_value = _to_float_or_none(margin)
+    if margin_value is None or margin_value <= 0:
+        return None
+    return margin_value
+
+
+def _resolve_trailing_runtime_metrics(uplink_obj, position_config):
+    """Resolve used margin and running PnL needed by trailing stop-loss logic."""
+    option_instrument = str(position_config.get('option_instrument', '') or '').strip()
+    entry_price = _to_float_or_none(position_config.get('entry_price'))
+    qty = int(position_config.get('qty', 0) or 0)
+
+    used_margin = _resolve_margin_via_margin_api(uplink_obj, position_config)
+
+    row = _get_position_row_for_instrument(uplink_obj, option_instrument)
+    if used_margin is None:
+        used_margin = _extract_row_numeric(
+            row,
+            [
+                'used_margin',
+                'margin_used',
+                'required_margin',
+                'span_margin',
+                'exposure_margin',
+                'margin',
+            ],
+            positive_only=True,
+        )
+
+    ltp_pnl, _ = _compute_short_pnl_from_ltp(uplink_obj, position_config)
+    running_pnl = ltp_pnl
+
+    if running_pnl is None and entry_price is not None and qty > 0:
+        row_ltp = _extract_row_numeric(
+            row,
+            [
+                'last_price',
+                'ltp',
+                'close',
+                'average_price',
+            ],
+            positive_only=True,
+        )
+        if row_ltp is not None:
+            running_pnl = (entry_price - row_ltp) * qty
+
+    if running_pnl is None:
+        running_pnl = _extract_row_numeric(
+            row,
+            [
+                'pnl',
+                'day_pnl',
+                'mtm',
+                'unrealized_pnl',
+                'unrealised_pnl',
+                'realized_pnl',
+                'realised_pnl',
+            ],
+            positive_only=False,
+        )
+        if running_pnl is not None:
+            logger.warning(
+                'Trailing stop-loss using broker-reported PnL fallback because fresh LTP was unavailable | instrument=%s',
+                option_instrument,
+            )
+
+    if used_margin is None and entry_price is not None and qty > 0:
+        used_margin = abs(entry_price * qty)
+
+    return used_margin, running_pnl
+
+
+def evaluate_trailing_stop_loss(uplink_obj, symbol, position_config):
+    """Evaluate trailing stop-loss for one open position and return action state."""
+    trailing_state = position_config.setdefault('trailing_stop_loss', {})
+    if not isinstance(trailing_state, dict):
+        trailing_state = {}
+        position_config['trailing_stop_loss'] = trailing_state
+
+    current_active = _normalize_bool(trailing_state.get('active', False))
+
+    if not is_trailing_stop_loss_enabled():
+        return {'active': current_active, 'action': 'none'}
+
+    used_margin, running_pnl = _resolve_trailing_runtime_metrics(uplink_obj, position_config)
+    if used_margin is None or used_margin <= 0 or running_pnl is None:
+        logger.warning(
+            'Trailing stop-loss skipped for %s due to missing metrics | used_margin=%s | running_pnl=%s',
+            symbol,
+            used_margin,
+            running_pnl,
+        )
+        return {
+            'active': current_active,
+            'action': 'none',
+            'running_pnl': float(running_pnl) if running_pnl is not None else None,
+            'used_margin': float(used_margin) if used_margin is not None else None,
+        }
+
+    activation_percent = get_trailing_activation_profit_percent_of_margin()
+    gap_percent = get_trailing_gap_percent_of_margin()
+    step_amount = get_trailing_step_absolute_rs()
+
+    activation_threshold = used_margin * (activation_percent / 100.0)
+    gap_amount = used_margin * (gap_percent / 100.0)
+
+    if not current_active:
+        if running_pnl < activation_threshold:
+            return {'active': False, 'action': 'none'}
+
+        trailing_state.update({
+            'active': True,
+            'used_margin': float(used_margin),
+            'activation_threshold_pnl': float(activation_threshold),
+            'gap_amount': float(gap_amount),
+            'last_peak_pnl': float(running_pnl),
+            'last_trail_anchor_pnl': float(running_pnl),
+            'stop_loss_pnl': float(running_pnl - gap_amount),
+            'activated_at': datetime.now(Config.TIME_ZONE).isoformat(),
+        })
+        logger.info(
+            '%s trailing stop-loss activated | running_pnl=%.2f | activation_threshold=%.2f | initial_stop_loss_pnl=%.2f | step=%.2f',
+            symbol,
+            running_pnl,
+            activation_threshold,
+            trailing_state['stop_loss_pnl'],
+            step_amount,
+        )
+    else:
+        trailing_state['used_margin'] = float(used_margin)
+        trailing_state['activation_threshold_pnl'] = float(activation_threshold)
+        trailing_state['gap_amount'] = float(gap_amount)
+
+        stop_loss_pnl = _to_float_or_none(trailing_state.get('stop_loss_pnl'))
+        if stop_loss_pnl is None:
+            stop_loss_pnl = float(running_pnl - gap_amount)
+            trailing_state['stop_loss_pnl'] = stop_loss_pnl
+
+        last_peak_pnl = _to_float_or_none(trailing_state.get('last_peak_pnl'))
+        if last_peak_pnl is None:
+            last_peak_pnl = float(running_pnl)
+        if running_pnl > last_peak_pnl:
+            last_peak_pnl = float(running_pnl)
+        trailing_state['last_peak_pnl'] = last_peak_pnl
+
+        anchor_pnl = _to_float_or_none(trailing_state.get('last_trail_anchor_pnl'))
+        if anchor_pnl is None:
+            anchor_pnl = float(last_peak_pnl)
+
+        if running_pnl >= anchor_pnl + step_amount:
+            step_count = int(math.floor((running_pnl - anchor_pnl) / step_amount))
+            if step_count > 0:
+                trail_move = float(step_count * step_amount)
+                trailing_state['stop_loss_pnl'] = float(stop_loss_pnl + trail_move)
+                trailing_state['last_trail_anchor_pnl'] = float(anchor_pnl + trail_move)
+                logger.info(
+                    '%s trailing stop-loss moved | running_pnl=%.2f | stop_loss_pnl=%.2f | move=%.2f',
+                    symbol,
+                    running_pnl,
+                    trailing_state['stop_loss_pnl'],
+                    trail_move,
+                )
+
+    active_stop_loss = _to_float_or_none(trailing_state.get('stop_loss_pnl'))
+    if active_stop_loss is not None and running_pnl < active_stop_loss:
+        logger.info(
+            '%s trailing stop-loss breached | running_pnl=%.2f | stop_loss_pnl=%.2f',
+            symbol,
+            running_pnl,
+            active_stop_loss,
+        )
+        return {
+            'active': True,
+            'action': 'exit',
+            'running_pnl': float(running_pnl),
+            'stop_loss_pnl': float(active_stop_loss),
+        }
+
+    final_active = _normalize_bool(trailing_state.get('active', False))
+    return {
+        'active': final_active,
+        'action': 'hold' if final_active else 'none',
+        'running_pnl': float(running_pnl),
+        'stop_loss_pnl': _to_float_or_none(trailing_state.get('stop_loss_pnl')),
+    }
 
 
 def is_trading_time():
@@ -354,6 +725,24 @@ def _to_positive_float(value):
     return None
 
 
+def _get_seeded_position_config(symbol):
+    """Return a normalized, valid seeded position from Config.POSITION_CONFIG."""
+    tracked_positions = getattr(Config, 'POSITION_CONFIG', {})
+    if not isinstance(tracked_positions, dict):
+        return None
+
+    seeded = tracked_positions.get(symbol)
+    if not isinstance(seeded, dict):
+        return None
+
+    option_instrument = str(seeded.get('option_instrument', '') or '').strip()
+    qty = int(seeded.get('qty', 0) or 0)
+    option_type = str(seeded.get('option_type', '') or '').upper()
+    if not option_instrument or qty <= 0 or option_type not in {'CE', 'PE'}:
+        return None
+    return dict(seeded)
+
+
 def _resolve_entry_price_from_position(uplink_obj, row, qty, option_instrument):
     """Resolve entry price from broker position fields with practical fallbacks."""
     direct_price_fields = [
@@ -393,6 +782,17 @@ def _resolve_entry_price_from_position(uplink_obj, row, qty, option_instrument):
 def _sync_position_config_from_broker(uplink_obj):
     """Populate runtime POSITION_CONFIG from existing broker positions."""
     symbol = 'NIFTY'
+    seeded_position = _get_seeded_position_config(symbol)
+
+    if seeded_position:
+        logger.info(
+            'Startup position seed detected in Config for %s | instrument=%s | qty=%s | entry_price=%s',
+            symbol,
+            seeded_position.get('option_instrument'),
+            seeded_position.get('qty'),
+            seeded_position.get('entry_price'),
+        )
+
     if not hasattr(uplink_obj, 'getPositionBook'):
         logger.warning('Position sync skipped: uplink has no getPositionBook method')
         return
@@ -408,7 +808,13 @@ def _sync_position_config_from_broker(uplink_obj):
         return
 
     if str(position_book.get('status', '')).lower() == 'error':
-        logger.warning('Position sync skipped: broker positions endpoint returned error payload: %s', position_book.get('errors', []))
+        if Config.is_sandbox_mode() or is_test_mode_enabled():
+            logger.info(
+                'Position sync skipped in sandbox/test mode: broker positions endpoint is unavailable; errors=%s',
+                position_book.get('errors', []),
+            )
+        else:
+            logger.warning('Position sync skipped: broker positions endpoint returned error payload: %s', position_book.get('errors', []))
         return
 
     positions = position_book.get('data', [])
@@ -451,6 +857,14 @@ def _sync_position_config_from_broker(uplink_obj):
         candidates.append((row, option_type, abs(net_qty)))
 
     if not candidates:
+        if seeded_position:
+            Config.POSITION_CONFIG[symbol] = seeded_position
+            logger.warning(
+                'No open short NIFTY option found in broker book during startup sync; retaining seeded Config position for %s',
+                symbol,
+            )
+            return
+
         Config.POSITION_CONFIG.pop(symbol, None)
         logger.info('No open short NIFTY option position found in broker book during startup sync')
         return
@@ -470,6 +884,19 @@ def _sync_position_config_from_broker(uplink_obj):
 
     selection_pool = candidates
     selection_reason = 'largest_short_position'
+
+    seeded_token = str(seeded_position.get('option_instrument', '')).strip() if seeded_position else ''
+    seeded_match_candidates = []
+    if seeded_token:
+        seeded_match_candidates = [
+            candidate
+            for candidate in candidates
+            if str(candidate[0].get('instrument_token', candidate[0].get('instrument_key', '')) or '').strip() == seeded_token
+        ]
+
+    if seeded_match_candidates:
+        selection_pool = seeded_match_candidates
+        selection_reason = 'config_seed_match'
     if tagged_position_candidates:
         selection_pool = tagged_position_candidates
         selection_reason = 'position_tag_match'
@@ -489,6 +916,10 @@ def _sync_position_config_from_broker(uplink_obj):
 
     option_instrument = str(selected_row.get('instrument_token', selected_row.get('instrument_key', '')))
     entry_price = _resolve_entry_price_from_position(uplink_obj, selected_row, int(qty), option_instrument)
+    if entry_price <= 0 and seeded_position:
+        seeded_entry_price = _to_positive_float(seeded_position.get('entry_price'))
+        if seeded_entry_price is not None:
+            entry_price = seeded_entry_price
     lots = max(1, int(round(qty / max(1, int(Config.NIFTY_CONFIG.get('lot_size', 1))))))
 
     Config.POSITION_CONFIG[symbol] = {
@@ -500,6 +931,21 @@ def _sync_position_config_from_broker(uplink_obj):
         'lots': lots,
         'source': 'broker_sync',
     }
+
+    if seeded_position:
+        if seeded_position.get('entry_order_id'):
+            Config.POSITION_CONFIG[symbol]['entry_order_id'] = seeded_position.get('entry_order_id')
+        if seeded_position.get('order_status'):
+            Config.POSITION_CONFIG[symbol]['order_status'] = seeded_position.get('order_status')
+        if isinstance(seeded_position.get('trailing_stop_loss'), dict):
+            Config.POSITION_CONFIG[symbol]['trailing_stop_loss'] = dict(seeded_position.get('trailing_stop_loss'))
+
+    if is_trailing_stop_loss_enabled():
+        try:
+            evaluate_trailing_stop_loss(uplink_obj, symbol, Config.POSITION_CONFIG[symbol])
+        except Exception as exc:
+            logger.exception('Startup trailing state restore failed for %s: %s', symbol, exc)
+
     logger.info('Startup position sync complete for %s: %s', symbol, Config.POSITION_CONFIG[symbol])
 
 
@@ -583,6 +1029,29 @@ def check_entry_signals(uplink_obj):
 
     if is_position_open:
         position_config = Config.POSITION_CONFIG[symbol]
+
+        if is_trailing_stop_loss_enabled():
+            trailing_status = evaluate_trailing_stop_loss(uplink_obj, symbol, position_config)
+            if trailing_status.get('action') == 'exit':
+                exit_position(uplink_obj, symbol, int(position_config.get('qty', 0)))
+                return
+            trailing_active = _normalize_bool(trailing_status.get('active', False))
+            if trailing_active:
+                logger.info(
+                    '%s trailing mode active | running_pnl=%s | stop_loss_pnl=%s | skipping pivot/supertrend checks',
+                    symbol,
+                    trailing_status.get('running_pnl'),
+                    trailing_status.get('stop_loss_pnl'),
+                )
+                return
+
+            logger.info(
+                '%s trailing mode not armed yet | running_pnl=%s | stop_loss_pnl=%s | continuing normal open-position checks',
+                symbol,
+                trailing_status.get('running_pnl'),
+                trailing_status.get('stop_loss_pnl'),
+            )
+
         signal = evaluate_strategy_signal(
             candle_data,
             position_open=True,
@@ -825,6 +1294,11 @@ def _run_signal_check_with_timeout(uplink_obj):
 def get_next_check_time(current_time=None):
     """Return the next timeframe-aligned check time with close-buffer applied."""
     now = current_time or datetime.now(Config.TIME_ZONE)
+
+    if is_trailing_stop_loss_enabled() and _is_any_trailing_mode_active():
+        trailing_interval_seconds = get_trailing_evaluation_interval_seconds()
+        return now + timedelta(seconds=trailing_interval_seconds)
+
     timeframe = max(1, int(Config.STRATEGY_CONFIG.get('TIMEFRAME', 5)))
     buffer_seconds = get_candle_close_buffer_seconds()
 
