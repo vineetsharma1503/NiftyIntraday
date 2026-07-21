@@ -593,6 +593,43 @@ class MainLoopTests(unittest.TestCase):
         self.assertTrue(result['active'])
         self.assertAlmostEqual(result['running_pnl'], 100.0)
 
+    def test_trailing_stop_loss_matches_position_row_on_numeric_token_suffix(self):
+        class TrailingUplink:
+            def getRequiredMargin(self, **_kwargs):
+                return None
+
+            def getPositionBook(self):
+                return {
+                    'data': [
+                        {
+                            'instrument_token': 'NFO_OPT|57346',
+                            'quantity': -260,
+                            'last_price': 20.0,
+                            'used_margin': 50000.0,
+                        }
+                    ]
+                }
+
+        position_config = {
+            'option_instrument': 'NSE_FO|57346',
+            'qty': 260,
+            'entry_price': 25.0,
+            'option_type': 'CE',
+        }
+
+        with patch('main.Config.STRATEGY_CONFIG', {
+                'ENABLE_TRAILING_STOP_LOSS': True,
+                'TRAILING_ACTIVATION_PROFIT_PERCENT_OF_MARGIN': 1.0,
+                'TRAILING_STOP_LOSS_GAP_PERCENT_OF_MARGIN': 0.5,
+                'TRAILING_STEP_ABSOLUTE_RS': 1000,
+            }, create=True):
+            result = evaluate_trailing_stop_loss(TrailingUplink(), 'NIFTY', position_config)
+
+        self.assertEqual(result['action'], 'hold')
+        self.assertTrue(result['active'])
+        self.assertAlmostEqual(result['running_pnl'], 1300.0)
+        self.assertAlmostEqual(result['used_margin'], 50000.0)
+
     def test_trailing_stop_loss_exits_when_running_pnl_below_trail(self):
         class TrailingUplink:
             def getRequiredMargin(self, **_kwargs):

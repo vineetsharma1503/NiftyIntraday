@@ -224,6 +224,18 @@ def _extract_row_numeric(row, keys, positive_only=False):
     return None
 
 
+def _normalize_instrument_identity(value):
+    """Normalize instrument identifier for resilient matching across API payload formats."""
+    raw = str(value or '').strip().upper().replace(':', '|')
+    if not raw:
+        return '', ''
+
+    token_part = raw.split('|')[-1].strip()
+    numeric_part = ''.join(ch for ch in token_part if ch.isdigit())
+    suffix = numeric_part or token_part
+    return raw, suffix
+
+
 def _get_position_row_for_instrument(uplink_obj, option_instrument):
     """Return broker position row matching the open option instrument."""
     if not hasattr(uplink_obj, 'getPositionBook'):
@@ -242,12 +254,19 @@ def _get_position_row_for_instrument(uplink_obj, option_instrument):
     if not isinstance(positions, list):
         return None
 
-    instrument_key = str(option_instrument or '').strip()
+    instrument_key, instrument_suffix = _normalize_instrument_identity(option_instrument)
+    if not instrument_key:
+        return None
+
     for row in positions:
         if not isinstance(row, dict):
             continue
+
         token = str(row.get('instrument_token', row.get('instrument_key', '')) or '').strip()
-        if token and token == instrument_key:
+        row_key, row_suffix = _normalize_instrument_identity(token)
+        if row_key and row_key == instrument_key:
+            return row
+        if row_suffix and instrument_suffix and row_suffix == instrument_suffix:
             return row
     return None
 
@@ -313,7 +332,27 @@ def _resolve_trailing_runtime_metrics(uplink_obj, position_config):
     entry_price = _to_float_or_none(position_config.get('entry_price'))
     qty = int(position_config.get('qty', 0) or 0)
 
+    diagnostics = {
+        'instrument': option_instrument,
+        'entry_price': entry_price,
+        'qty': qty,
+        'ltp': None,
+        'pnl_source': None,
+        'margin_source': None,
+    }
+
     used_margin = _resolve_margin_via_margin_api(uplink_obj, position_config)
+    if used_margin is not None:
+        diagnostics['margin_source'] = 'margin_api'
+
+    if used_margin is None:
+        used_margin = _extract_row_numeric(
+            position_config,
+            ['used_margin', 'required_margin'],
+            positive_only=True,
+        )
+        if used_margin is not None:
+            diagnostics['margin_source'] = 'position_config'
 
     row = _get_position_row_for_instrument(uplink_obj, option_instrument)
     if used_margin is None:
@@ -329,9 +368,14 @@ def _resolve_trailing_runtime_metrics(uplink_obj, position_config):
             ],
             positive_only=True,
         )
+        if used_margin is not None:
+            diagnostics['margin_source'] = 'position_book'
 
-    ltp_pnl, _ = _compute_short_pnl_from_ltp(uplink_obj, position_config)
+    ltp_pnl, ltp_value = _compute_short_pnl_from_ltp(uplink_obj, position_config)
+    diagnostics['ltp'] = ltp_value
     running_pnl = ltp_pnl
+    if running_pnl is not None:
+        diagnostics['pnl_source'] = 'ltp_api'
 
     if running_pnl is None and entry_price is not None and qty > 0:
         row_ltp = _extract_row_numeric(
@@ -345,7 +389,9 @@ def _resolve_trailing_runtime_metrics(uplink_obj, position_config):
             positive_only=True,
         )
         if row_ltp is not None:
+            diagnostics['ltp'] = row_ltp
             running_pnl = (entry_price - row_ltp) * qty
+            diagnostics['pnl_source'] = 'position_book_ltp'
 
     if running_pnl is None:
         running_pnl = _extract_row_numeric(
@@ -362,6 +408,7 @@ def _resolve_trailing_runtime_metrics(uplink_obj, position_config):
             positive_only=False,
         )
         if running_pnl is not None:
+            diagnostics['pnl_source'] = 'position_book_pnl'
             logger.warning(
                 'Trailing stop-loss using broker-reported PnL fallback because fresh LTP was unavailable | instrument=%s',
                 option_instrument,
@@ -369,8 +416,32 @@ def _resolve_trailing_runtime_metrics(uplink_obj, position_config):
 
     if used_margin is None and entry_price is not None and qty > 0:
         used_margin = abs(entry_price * qty)
+        diagnostics['margin_source'] = 'entry_notional_fallback'
 
-    return used_margin, running_pnl
+    diagnostics['used_margin'] = float(used_margin) if used_margin is not None else None
+    diagnostics['running_pnl'] = float(running_pnl) if running_pnl is not None else None
+
+    return used_margin, running_pnl, diagnostics
+
+
+def _log_trailing_dashboard(symbol, payload, note=''):
+    """Emit a compact single-line snapshot of trailing stop runtime state."""
+    data = payload if isinstance(payload, dict) else {}
+    logger.info(
+        'TRAILING_DASHBOARD | symbol=%s | action=%s | active=%s | pnl=%s | margin=%s | threshold=%s | sl=%s | gap=%s | ltp=%s | pnl_src=%s | margin_src=%s | note=%s',
+        symbol,
+        data.get('action'),
+        data.get('active'),
+        data.get('running_pnl'),
+        data.get('used_margin'),
+        data.get('activation_threshold_pnl'),
+        data.get('stop_loss_pnl'),
+        data.get('gap_amount'),
+        data.get('ltp'),
+        data.get('pnl_source'),
+        data.get('margin_source'),
+        note,
+    )
 
 
 def evaluate_trailing_stop_loss(uplink_obj, symbol, position_config):
@@ -383,9 +454,25 @@ def evaluate_trailing_stop_loss(uplink_obj, symbol, position_config):
     current_active = _normalize_bool(trailing_state.get('active', False))
 
     if not is_trailing_stop_loss_enabled():
-        return {'active': current_active, 'action': 'none'}
+        result = {'active': current_active, 'action': 'none'}
+        _log_trailing_dashboard(symbol, result, note='feature_disabled')
+        return result
 
-    used_margin, running_pnl = _resolve_trailing_runtime_metrics(uplink_obj, position_config)
+    used_margin, running_pnl, diagnostics = _resolve_trailing_runtime_metrics(uplink_obj, position_config)
+
+    logger.info(
+        '%s trailing metrics | instrument=%s | qty=%s | entry_price=%s | ltp=%s | running_pnl=%s | used_margin=%s | pnl_source=%s | margin_source=%s',
+        symbol,
+        diagnostics.get('instrument'),
+        diagnostics.get('qty'),
+        diagnostics.get('entry_price'),
+        diagnostics.get('ltp'),
+        diagnostics.get('running_pnl'),
+        diagnostics.get('used_margin'),
+        diagnostics.get('pnl_source'),
+        diagnostics.get('margin_source'),
+    )
+
     if used_margin is None or used_margin <= 0 or running_pnl is None:
         logger.warning(
             'Trailing stop-loss skipped for %s due to missing metrics | used_margin=%s | running_pnl=%s',
@@ -393,12 +480,17 @@ def evaluate_trailing_stop_loss(uplink_obj, symbol, position_config):
             used_margin,
             running_pnl,
         )
-        return {
+        result = {
             'active': current_active,
             'action': 'none',
             'running_pnl': float(running_pnl) if running_pnl is not None else None,
             'used_margin': float(used_margin) if used_margin is not None else None,
+            'ltp': diagnostics.get('ltp'),
+            'margin_source': diagnostics.get('margin_source'),
+            'pnl_source': diagnostics.get('pnl_source'),
         }
+        _log_trailing_dashboard(symbol, result, note='missing_metrics')
+        return result
 
     activation_percent = get_trailing_activation_profit_percent_of_margin()
     gap_percent = get_trailing_gap_percent_of_margin()
@@ -407,9 +499,38 @@ def evaluate_trailing_stop_loss(uplink_obj, symbol, position_config):
     activation_threshold = used_margin * (activation_percent / 100.0)
     gap_amount = used_margin * (gap_percent / 100.0)
 
+    logger.info(
+        '%s trailing params | active=%s | activation_pct=%s | gap_pct=%s | step=%s | activation_threshold=%s | gap_amount=%s',
+        symbol,
+        current_active,
+        activation_percent,
+        gap_percent,
+        step_amount,
+        activation_threshold,
+        gap_amount,
+    )
+
     if not current_active:
         if running_pnl < activation_threshold:
-            return {'active': False, 'action': 'none'}
+            logger.info(
+                '%s trailing not armed | running_pnl=%.2f below activation_threshold=%.2f',
+                symbol,
+                running_pnl,
+                activation_threshold,
+            )
+            result = {
+                'active': False,
+                'action': 'none',
+                'running_pnl': float(running_pnl),
+                'used_margin': float(used_margin),
+                'activation_threshold_pnl': float(activation_threshold),
+                'gap_amount': float(gap_amount),
+                'ltp': diagnostics.get('ltp'),
+                'margin_source': diagnostics.get('margin_source'),
+                'pnl_source': diagnostics.get('pnl_source'),
+            }
+            _log_trailing_dashboard(symbol, result, note='awaiting_activation')
+            return result
 
         trailing_state.update({
             'active': True,
@@ -472,20 +593,36 @@ def evaluate_trailing_stop_loss(uplink_obj, symbol, position_config):
             running_pnl,
             active_stop_loss,
         )
-        return {
+        result = {
             'active': True,
             'action': 'exit',
             'running_pnl': float(running_pnl),
+            'used_margin': float(used_margin),
             'stop_loss_pnl': float(active_stop_loss),
+            'activation_threshold_pnl': float(activation_threshold),
+            'gap_amount': float(gap_amount),
+            'ltp': diagnostics.get('ltp'),
+            'margin_source': diagnostics.get('margin_source'),
+            'pnl_source': diagnostics.get('pnl_source'),
         }
+        _log_trailing_dashboard(symbol, result, note='trail_breached')
+        return result
 
     final_active = _normalize_bool(trailing_state.get('active', False))
-    return {
+    result = {
         'active': final_active,
         'action': 'hold' if final_active else 'none',
         'running_pnl': float(running_pnl),
+        'used_margin': float(used_margin),
         'stop_loss_pnl': _to_float_or_none(trailing_state.get('stop_loss_pnl')),
+        'activation_threshold_pnl': _to_float_or_none(trailing_state.get('activation_threshold_pnl')),
+        'gap_amount': _to_float_or_none(trailing_state.get('gap_amount')),
+        'ltp': diagnostics.get('ltp'),
+        'margin_source': diagnostics.get('margin_source'),
+        'pnl_source': diagnostics.get('pnl_source'),
     }
+    _log_trailing_dashboard(symbol, result, note='evaluated')
+    return result
 
 
 def is_trading_time():
@@ -1038,18 +1175,28 @@ def check_entry_signals(uplink_obj):
             trailing_active = _normalize_bool(trailing_status.get('active', False))
             if trailing_active:
                 logger.info(
-                    '%s trailing mode active | running_pnl=%s | stop_loss_pnl=%s | skipping pivot/supertrend checks',
+                    '%s trailing mode active | running_pnl=%s | used_margin=%s | activation_threshold_pnl=%s | stop_loss_pnl=%s | gap_amount=%s | pnl_source=%s | margin_source=%s | skipping pivot/supertrend checks',
                     symbol,
                     trailing_status.get('running_pnl'),
+                    trailing_status.get('used_margin'),
+                    trailing_status.get('activation_threshold_pnl'),
                     trailing_status.get('stop_loss_pnl'),
+                    trailing_status.get('gap_amount'),
+                    trailing_status.get('pnl_source'),
+                    trailing_status.get('margin_source'),
                 )
                 return
 
             logger.info(
-                '%s trailing mode not armed yet | running_pnl=%s | stop_loss_pnl=%s | continuing normal open-position checks',
+                '%s trailing mode not armed yet | running_pnl=%s | used_margin=%s | activation_threshold_pnl=%s | stop_loss_pnl=%s | gap_amount=%s | pnl_source=%s | margin_source=%s | continuing normal open-position checks',
                 symbol,
                 trailing_status.get('running_pnl'),
+                trailing_status.get('used_margin'),
+                trailing_status.get('activation_threshold_pnl'),
                 trailing_status.get('stop_loss_pnl'),
+                trailing_status.get('gap_amount'),
+                trailing_status.get('pnl_source'),
+                trailing_status.get('margin_source'),
             )
 
         signal = evaluate_strategy_signal(
@@ -1137,6 +1284,36 @@ def execute_entry(uplink_obj, symbol, symbol_config, spot_price, option_type, qt
             logger.error('Entry order placement failed for %s', symbol)
             return False
 
+        used_margin = None
+        if hasattr(uplink_obj, 'getRequiredMargin'):
+            try:
+                used_margin = uplink_obj.getRequiredMargin(
+                    instrument_key=option_instrument,
+                    quantity=order_qty,
+                    transaction_type='SELL',
+                    product=getattr(Config, 'ORDER_TYPE', 'I'),
+                )
+            except Exception as exc:
+                logger.warning('Entry margin fetch failed for %s: %s', option_instrument, exc)
+
+        parsed_used_margin = _to_float_or_none(used_margin)
+        if parsed_used_margin is not None and parsed_used_margin > 0:
+            logger.info(
+                '%s entry margin snapshot | instrument=%s | qty=%s | required_margin=%s',
+                symbol,
+                option_instrument,
+                order_qty,
+                parsed_used_margin,
+            )
+        else:
+            logger.warning(
+                '%s entry margin snapshot unavailable | instrument=%s | qty=%s | margin_response=%s',
+                symbol,
+                option_instrument,
+                order_qty,
+                used_margin,
+            )
+
         use_v3_order_flow = hasattr(uplink_obj, '_use_v3_order_api') and uplink_obj._use_v3_order_api()
         if use_v3_order_flow:
             # V3 place-order returns acknowledgment; keep fill tracking separate from entry signal path.
@@ -1155,6 +1332,9 @@ def execute_entry(uplink_obj, symbol, symbol_config, spot_price, option_type, qt
                 'entry_price': entry_price,
                 'option_type': option_type,
                 'lots': lots,
+                'product': getattr(Config, 'ORDER_TYPE', 'I'),
+                'transaction_type': 'SELL',
+                'used_margin': parsed_used_margin,
                 'entry_order_id': entry_order_id,
                 'order_status': 'submitted',
             }
@@ -1179,6 +1359,9 @@ def execute_entry(uplink_obj, symbol, symbol_config, spot_price, option_type, qt
                 'entry_price': entry_price,
                 'option_type': option_type,
                 'lots': lots,
+                'product': getattr(Config, 'ORDER_TYPE', 'I'),
+                'transaction_type': 'SELL',
+                'used_margin': parsed_used_margin,
             }
             logger.info(f'{symbol} entry successful at price: {entry_price}')
             return True
