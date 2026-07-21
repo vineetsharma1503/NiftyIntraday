@@ -615,14 +615,49 @@ class UpstoxApi:
 
         return str(timeframe)
 
+    @staticmethod
+    def _get_market_session_start(reference_time):
+        """Return the current trading session anchor used for candle alignment."""
+        return reference_time.replace(hour=9, minute=15, second=0, microsecond=0)
+
+    def _get_last_complete_candle_timestamp(self, source_data, timeframe, current_time=None):
+        """Resolve the latest fully backed candle timestamp from raw minute bars."""
+        if source_data is None or source_data.empty or 'date' not in source_data.columns:
+            return None
+
+        now = current_time or datetime.now(Config.TIME_ZONE)
+        minute_boundary = now.replace(second=0, microsecond=0)
+        complete_source = source_data.copy()
+        complete_source['date'] = pd.to_datetime(complete_source['date'], errors='coerce')
+        complete_source = complete_source.dropna(subset=['date'])
+        complete_source = complete_source[complete_source['date'] < minute_boundary]
+        if complete_source.empty:
+            return None
+
+        timeframe_minutes = max(1, int(timeframe or 1))
+        if timeframe_minutes == 1:
+            return complete_source['date'].max()
+
+        session_start = self._get_market_session_start(now)
+        latest_source_ts = complete_source['date'].max()
+        available_until = latest_source_ts + timedelta(minutes=1)
+        elapsed_minutes = int((available_until - session_start).total_seconds() // 60)
+        completed_intervals = elapsed_minutes // timeframe_minutes
+        if completed_intervals <= 0:
+            return None
+
+        return session_start + timedelta(minutes=(completed_intervals - 1) * timeframe_minutes)
+
     def customCandleData(self, instrument_key, timeframe):
         """Get custom timeframe candle data for strategy"""
         try:
+            current_time = datetime.now(Config.TIME_ZONE)
+
             # Get cached or fresh historical data
             if instrument_key in Config.CANDLE_DATA_CACHE:
                 hist_df = Config.CANDLE_DATA_CACHE[instrument_key]
             else:
-                today = datetime.now(Config.TIME_ZONE).date()
+                today = current_time.date()
                 to_date = (today - timedelta(days=1)).strftime('%Y-%m-%d')
                 from_date = (today - timedelta(days=5)).strftime('%Y-%m-%d')
                 
@@ -638,6 +673,9 @@ class UpstoxApi:
             # Upstox intraday candles only support 1minute/30minute.
             intra_data = self.getIntraData(instrument_key, '1minute')
             if intra_data is not None and not intra_data.empty:
+                # Use wall-clock close filtering below as the source of truth.
+                # Waiting for fully backfilled source minutes can delay signals by one full timeframe
+                # when the upstream 1-minute feed lags by a few minutes.
                 intra_df = intra_data if timeframe == 1 else self._resample_data(intra_data, timeframe)
                 final_data = pd.concat([hist_df, intra_df], ignore_index=True)
             else:
@@ -653,9 +691,8 @@ class UpstoxApi:
             final_data['date'] = pd.to_datetime(final_data['date'], errors='coerce', utc=True).dt.tz_convert('Asia/Kolkata')
             final_data = final_data.dropna(subset=['date'])
 
-            # Filter to last complete candle
-            current_time = datetime.now(Config.TIME_ZONE)
-            start_time = current_time.replace(hour=9, minute=15, second=0)
+            # Filter to the latest fully closed wall-clock candle as a final guardrail.
+            start_time = self._get_market_session_start(current_time)
             min_from_start = math.floor((current_time - start_time).seconds / 60)
             last_tf = int(min_from_start / timeframe) * timeframe - timeframe
             last_timestamp = start_time + timedelta(minutes=last_tf)
@@ -691,7 +728,7 @@ class UpstoxApi:
 
             # Resample data
             freq = self._normalize_timeframe(timeframe)
-            resampled = data.resample(freq, origin='start').agg({
+            resampled = data.resample(freq, origin='start_day', offset='15min').agg({
                 'open': 'first', 
                 'high': 'max', 
                 'low': 'min', 

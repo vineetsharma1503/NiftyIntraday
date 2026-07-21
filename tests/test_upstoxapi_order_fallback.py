@@ -1,5 +1,8 @@
 import unittest
+from datetime import datetime
 from unittest.mock import patch
+
+import pandas as pd
 
 from upstoxapi import UpstoxApi
 
@@ -90,10 +93,19 @@ class UpstoxApiOrderFallbackTests(unittest.TestCase):
         self.assertEqual(payload.get('data', [{}])[0].get('order_id'), 'abc')
 
     def test_init_points_sdk_clients_to_configured_v2_host(self):
-        with patch('upstoxapi.Config.get_upstox_v2_base_url', return_value='https://api-sandbox.upstox.com'):
+        with patch('upstoxapi.Config.STRATEGY_CONFIG', {'SANDBOX_MODE': True}):
             api = UpstoxApi('test-token')
 
+        self.assertEqual(api.order_instance.api_client.configuration.host, 'https://api-sandbox.upstox.com')
         self.assertEqual(api.position_instance.api_client.configuration.host, 'https://api-sandbox.upstox.com')
+        self.assertEqual(api.quote_instance.api_client.configuration.host, 'https://api.upstox.com')
+        self.assertEqual(api.histdata_instance.api_client.configuration.host, 'https://api.upstox.com')
+
+    def test_quote_base_url_ignores_sandbox_mode(self):
+        with patch('upstoxapi.Config.STRATEGY_CONFIG', {'SANDBOX_MODE': True}):
+            api = self._make_api()
+
+        self.assertEqual(api._get_v3_quote_base_url(), 'https://api.upstox.com')
 
     def test_get_position_book_uses_direct_v2_request_in_sandbox(self):
         api = self._make_api()
@@ -118,6 +130,61 @@ class UpstoxApiOrderFallbackTests(unittest.TestCase):
         self.assertEqual(len(api.position_instance.calls), 1)
         self.assertEqual(payload.get('status'), 'success')
         self.assertEqual(payload.get('data', [{}])[0].get('instrument_token'), 'NFO_OPT|FALLBACK')
+
+    def test_get_required_margin_prefers_required_margin_field(self):
+        api = self._make_api()
+        api.getMarginDetails = lambda _instruments: {
+            'status': 'success',
+            'data': {
+                'required_margin': 123456.78,
+                'final_margin': 120000.0,
+                'margins': [{'total_margin': 119000.0}],
+            },
+        }
+
+        with patch('upstoxapi.Config.ORDER_TYPE', 'I'):
+            margin = api.getRequiredMargin('NFO_OPT|TEST', 75, transaction_type='SELL')
+
+        self.assertAlmostEqual(margin, 123456.78)
+
+    def test_custom_candle_data_uses_latest_wall_clock_closed_bucket(self):
+        api = self._make_api()
+        historical = pd.DataFrame([
+            {'date': '2026-07-17 15:25:00+05:30', 'open': 24341.55, 'high': 24352.65, 'low': 24339.20, 'close': 24346.70, 'volume': 0, 'oi': 0},
+        ])
+        intraday = pd.DataFrame([
+            {'date': '2026-07-20 13:00:00+05:30', 'open': 24186.70, 'high': 24189.35, 'low': 24179.90, 'close': 24185.20, 'volume': 0, 'oi': 0},
+            {'date': '2026-07-20 13:01:00+05:30', 'open': 24185.55, 'high': 24186.55, 'low': 24175.80, 'close': 24179.85, 'volume': 0, 'oi': 0},
+            {'date': '2026-07-20 13:02:00+05:30', 'open': 24180.15, 'high': 24196.45, 'low': 24178.05, 'close': 24194.30, 'volume': 0, 'oi': 0},
+            {'date': '2026-07-20 13:05:00+05:30', 'open': 24185.55, 'high': 24186.55, 'low': 24175.80, 'close': 24179.85, 'volume': 0, 'oi': 0},
+            {'date': '2026-07-20 13:06:00+05:30', 'open': 24180.15, 'high': 24190.00, 'low': 24178.05, 'close': 24188.00, 'volume': 0, 'oi': 0},
+            {'date': '2026-07-20 13:07:00+05:30', 'open': 24188.00, 'high': 24196.45, 'low': 24185.00, 'close': 24194.30, 'volume': 0, 'oi': 0},
+            {'date': '2026-07-20 13:10:00+05:30', 'open': 24180.15, 'high': 24210.00, 'low': 24178.05, 'close': 24200.00, 'volume': 0, 'oi': 0},
+            {'date': '2026-07-20 13:11:00+05:30', 'open': 24200.00, 'high': 24226.00, 'low': 24199.50, 'close': 24225.00, 'volume': 0, 'oi': 0},
+        ])
+
+        api.getHistoricalData = lambda *_args, **_kwargs: historical.copy()
+        api.getIntraData = lambda *_args, **_kwargs: intraday.copy()
+
+        with patch('upstoxapi.Config.CANDLE_DATA_CACHE', {}, create=True), \
+             patch('upstoxapi.datetime') as mock_datetime:
+            mock_datetime.now.return_value = pd.Timestamp('2026-07-20 13:15:01', tz='Asia/Kolkata').to_pydatetime()
+            candles = api.customCandleData('NSE_INDEX|Nifty 50', 5)
+
+        self.assertEqual(candles.iloc[-1]['date'], pd.Timestamp('2026-07-20 13:10:00', tz='Asia/Kolkata'))
+
+    def test_resample_data_stays_aligned_to_915_even_if_first_tick_is_916(self):
+        api = self._make_api()
+        source = pd.DataFrame([
+            {'date': '2026-07-20 09:16:00+05:30', 'open': 100.0, 'high': 101.0, 'low': 99.0, 'close': 100.5, 'volume': 1, 'oi': 0},
+            {'date': '2026-07-20 09:17:00+05:30', 'open': 100.5, 'high': 102.0, 'low': 100.0, 'close': 101.5, 'volume': 1, 'oi': 0},
+            {'date': '2026-07-20 09:18:00+05:30', 'open': 101.5, 'high': 103.0, 'low': 101.0, 'close': 102.5, 'volume': 1, 'oi': 0},
+            {'date': '2026-07-20 09:19:00+05:30', 'open': 102.5, 'high': 104.0, 'low': 102.0, 'close': 103.5, 'volume': 1, 'oi': 0},
+        ])
+
+        resampled = api._resample_data(source, 5)
+
+        self.assertEqual(resampled.iloc[0]['date'], pd.Timestamp('2026-07-20 09:15:00', tz='Asia/Kolkata'))
 
 
 if __name__ == '__main__':
