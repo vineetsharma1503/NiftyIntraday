@@ -678,6 +678,109 @@ def check_stop_loss_target(uplink_obj, symbol, position_config):
         return False
 
 
+def _get_runtime_day_summary():
+    """Return mutable runtime summary bucket for current trading date."""
+    today = datetime.now(Config.TIME_ZONE).strftime('%Y-%m-%d')
+    summary = getattr(Config, 'RUNTIME_DAY_SUMMARY', {})
+    if not isinstance(summary, dict) or summary.get('date') != today:
+        summary = {'date': today, 'symbols': {}}
+        setattr(Config, 'RUNTIME_DAY_SUMMARY', summary)
+
+    symbols = summary.get('symbols')
+    if not isinstance(symbols, dict):
+        summary['symbols'] = {}
+    return summary
+
+
+def _get_runtime_symbol_summary(symbol):
+    """Return mutable per-symbol runtime summary state."""
+    summary = _get_runtime_day_summary()
+    symbols = summary['symbols']
+    if symbol not in symbols or not isinstance(symbols.get(symbol), dict):
+        symbols[symbol] = {
+            'entries': 0,
+            'trailing_exits': 0,
+            'signal_exits': 0,
+            'squareoff_exits': 0,
+            'entry_order_ids': [],
+            'exit_order_ids': [],
+        }
+    return symbols[symbol]
+
+
+def _record_entry_summary(symbol, entry_order_id=None):
+    """Track one successful strategy entry in runtime summary."""
+    data = _get_runtime_symbol_summary(symbol)
+    data['entries'] = int(data.get('entries', 0)) + 1
+
+    order_id = str(entry_order_id or '').strip()
+    if order_id and order_id not in data['entry_order_ids']:
+        data['entry_order_ids'].append(order_id)
+
+
+def _record_exit_summary(symbol, reason, exit_order_id=None):
+    """Track one successful strategy exit in runtime summary."""
+    data = _get_runtime_symbol_summary(symbol)
+    normalized = str(reason or '').strip().lower()
+
+    if normalized == 'trailing':
+        data['trailing_exits'] = int(data.get('trailing_exits', 0)) + 1
+    elif normalized == 'signal':
+        data['signal_exits'] = int(data.get('signal_exits', 0)) + 1
+    elif normalized == 'squareoff':
+        data['squareoff_exits'] = int(data.get('squareoff_exits', 0)) + 1
+
+    order_id = str(exit_order_id or '').strip()
+    if order_id and order_id not in data['exit_order_ids']:
+        data['exit_order_ids'].append(order_id)
+
+
+def log_final_day_summary(note=''):
+    """Log an end-of-run summary of strategy activity for the day."""
+    summary = _get_runtime_day_summary()
+    symbols = summary.get('symbols', {})
+    if not isinstance(symbols, dict):
+        symbols = {}
+
+    totals = {
+        'entries': 0,
+        'trailing_exits': 0,
+        'signal_exits': 0,
+        'squareoff_exits': 0,
+    }
+
+    for symbol, data in symbols.items():
+        if not isinstance(data, dict):
+            continue
+        totals['entries'] += int(data.get('entries', 0))
+        totals['trailing_exits'] += int(data.get('trailing_exits', 0))
+        totals['signal_exits'] += int(data.get('signal_exits', 0))
+        totals['squareoff_exits'] += int(data.get('squareoff_exits', 0))
+
+        logger.info(
+            'FINAL_DAY_SUMMARY_SYMBOL | date=%s | symbol=%s | entries=%s | trailing_exits=%s | signal_exits=%s | squareoff_exits=%s | entry_order_ids=%s | exit_order_ids=%s',
+            summary.get('date'),
+            symbol,
+            int(data.get('entries', 0)),
+            int(data.get('trailing_exits', 0)),
+            int(data.get('signal_exits', 0)),
+            int(data.get('squareoff_exits', 0)),
+            data.get('entry_order_ids', []),
+            data.get('exit_order_ids', []),
+        )
+
+    logger.info(
+        'FINAL_DAY_SUMMARY | date=%s | symbols=%s | entries=%s | trailing_exits=%s | signal_exits=%s | squareoff_exits=%s | note=%s',
+        summary.get('date'),
+        len(symbols),
+        totals['entries'],
+        totals['trailing_exits'],
+        totals['signal_exits'],
+        totals['squareoff_exits'],
+        note,
+    )
+
+
 def _get_daily_entry_count(symbol):
     """Return the number of entries already taken for the current day."""
     today = datetime.now(Config.TIME_ZONE).strftime('%Y-%m-%d')
@@ -1088,6 +1191,7 @@ def _sync_position_config_from_broker(uplink_obj):
 
 def initialize_runtime_state(uplink_obj):
     """Load persisted runtime counters and position state once at startup."""
+    _get_runtime_day_summary()
     _load_daily_entry_counts_once()
     _sync_position_config_from_broker(uplink_obj)
 
@@ -1170,7 +1274,9 @@ def check_entry_signals(uplink_obj):
         if is_trailing_stop_loss_enabled():
             trailing_status = evaluate_trailing_stop_loss(uplink_obj, symbol, position_config)
             if trailing_status.get('action') == 'exit':
-                exit_position(uplink_obj, symbol, int(position_config.get('qty', 0)))
+                exit_order_id = exit_position(uplink_obj, symbol, int(position_config.get('qty', 0)))
+                if symbol not in Config.POSITION_CONFIG:
+                    _record_exit_summary(symbol, 'trailing', exit_order_id)
                 return
             trailing_active = _normalize_bool(trailing_status.get('active', False))
             if trailing_active:
@@ -1210,7 +1316,9 @@ def check_entry_signals(uplink_obj):
             log_pivot_details=log_pivot_details,
         )
         if signal.get('action') == 'exit':
-            exit_position(uplink_obj, symbol, int(position_config.get('qty', 0)))
+            exit_order_id = exit_position(uplink_obj, symbol, int(position_config.get('qty', 0)))
+            if symbol not in Config.POSITION_CONFIG:
+                _record_exit_summary(symbol, 'signal', exit_order_id)
             return
         return
 
@@ -1342,6 +1450,7 @@ def execute_entry(uplink_obj, symbol, symbol_config, spot_price, option_type, qt
                 logger.info('%s entry submitted via V3 order API | order_id=%s | entry_ltp=%s', symbol, entry_order_id, entry_price)
             else:
                 logger.info('%s entry submitted via V3 order API | order_id=%s', symbol, entry_order_id)
+            _record_entry_summary(symbol, entry_order_id)
             return True
 
         for i in range(10):
@@ -1364,6 +1473,7 @@ def execute_entry(uplink_obj, symbol, symbol_config, spot_price, option_type, qt
                 'used_margin': parsed_used_margin,
             }
             logger.info(f'{symbol} entry successful at price: {entry_price}')
+            _record_entry_summary(symbol, entry_order_id)
             return True
         else:
             logger.warning(f'Entry order {entry_order_id} not completed')
@@ -1378,11 +1488,13 @@ def exit_position(uplink_obj, symbol, qty):
     """Exit existing position"""
     try:
         logger.info(f'{symbol} exiting position')
-        uplink_obj.closePosition(Config.POSITION_CONFIG[symbol]['option_instrument'], qty, 'BUY')
+        exit_order_id = uplink_obj.closePosition(Config.POSITION_CONFIG[symbol]['option_instrument'], qty, 'BUY')
         Config.POSITION_CONFIG.pop(symbol)
         logger.info(f'{symbol} position closed')
+        return exit_order_id
     except Exception as e:
         logger.exception(f'Error in position exit: {e}')
+        return None
 
 
 def get_sync_time():
@@ -1438,9 +1550,10 @@ def square_off_tracked_positions(uplink_obj, context_message=''):
             continue
 
         try:
-            uplink_obj.closePosition(option_instrument, qty, 'BUY')
+            exit_order_id = uplink_obj.closePosition(option_instrument, qty, 'BUY')
             Config.POSITION_CONFIG.pop(symbol, None)
             closed_count += 1
+            _record_exit_summary(symbol, 'squareoff', exit_order_id)
             logger.info('Square-off submitted for %s | instrument=%s | qty=%s', symbol, option_instrument, qty)
         except Exception as exc:
             logger.exception('Failed to square off tracked position for %s: %s', symbol, exc)
@@ -1600,3 +1713,4 @@ if __name__ == '__main__':
     
     logger.info('Market closed - Squaring off all positions')
     square_off_tracked_positions(uplink_obj, 'Post-loop market close handler')
+    log_final_day_summary(note='strategy_run_complete')
